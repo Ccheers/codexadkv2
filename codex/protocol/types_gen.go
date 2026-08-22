@@ -3713,7 +3713,8 @@ type ThreadRealtimeStartParams struct {
 	Model *string `json:"model,omitempty"`
 	// Selects text or audio output for the realtime session. Transport and voice stay independent so clients can choose how they connect separately from what the model emits.
 	OutputModality RealtimeOutputModality `json:"outputModality"`
-	Prompt         *string                `json:"prompt,omitempty"`
+	// Tri-state: absent leaves the value unchanged, an explicit null clears it.
+	Prompt *Nullable[string] `json:"prompt,omitempty"`
 	// Developer instructions given to the backing Codex model when this realtime session ends.
 	RealtimeEndInstructions *string `json:"realtimeEndInstructions,omitempty"`
 	RealtimeSessionID       *string `json:"realtimeSessionId,omitempty"`
@@ -4124,7 +4125,8 @@ type ThreadSettingsUpdateParams struct {
 	// Override the sandbox policy for subsequent turns.
 	SandboxPolicy *SandboxPolicy `json:"sandboxPolicy,omitempty"`
 	// Override the service tier for subsequent turns. `null` clears the current service tier; omission leaves it unchanged.
-	ServiceTier *string `json:"serviceTier,omitempty"`
+	// Tri-state: absent leaves the value unchanged, an explicit null clears it.
+	ServiceTier *Nullable[string] `json:"serviceTier,omitempty"`
 	// Override the reasoning summary for subsequent turns.
 	Summary  *ReasoningSummary `json:"summary,omitempty"`
 	ThreadID string            `json:"threadId"`

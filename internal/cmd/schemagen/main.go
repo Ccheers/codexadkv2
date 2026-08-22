@@ -197,12 +197,28 @@ var skipTypes = map[string]bool{
 // null clears it. The JSON Schema collapses this to ["string","null"] and loses
 // the distinction, so it must be recorded by hand. Only the TypeScript output
 // preserves it (as `| null | null`). Keyed "TypeName.fieldName".
+//
+// To re-derive this list after a schema upgrade, since the JSON Schema cannot
+// tell you:
+//
+//	codex app-server generate-ts --out /tmp/codex-ts --experimental
+//	grep -rl "null | null" /tmp/codex-ts
+//
+// Every field matching `| null | null` in that output belongs here. A missing
+// entry is a silent bug: the field generates as a plain pointer, and callers
+// have no way to express "clear this value".
 var triStateFields = map[string]bool{
 	"ThreadStartParams.serviceTier":          true,
 	"ThreadResumeParams.serviceTier":         true,
 	"ThreadForkParams.serviceTier":           true,
 	"TurnStartParams.serviceTier":            true,
 	"CollaborationModeMask.reasoning_effort": true,
+
+	// These two were missed when the table was first written and found later by
+	// re-running the grep above. Both are on types the typed API does not wrap,
+	// which is why nothing caught them sooner.
+	"ThreadSettingsUpdateParams.serviceTier": true,
+	"ThreadRealtimeStartParams.prompt":       true,
 }
 
 func classify(name string, s *Schema) Def {

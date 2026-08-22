@@ -285,3 +285,35 @@ func assertJSONEqualBytes(t *testing.T, got []byte, want string) {
 		t.Errorf("JSON mismatch:\n got: %s\nwant: %s", ga, gb)
 	}
 }
+
+// TestTriStateFieldsAreComplete guards the one thing the JSON Schema cannot tell
+// the generator.
+//
+// A field whose Rust type is Option<Option<T>> distinguishes "absent" from
+// "explicit null", but the JSON Schema collapses both into a plain nullable. Only
+// the TypeScript output preserves the distinction, as `| null | null`. So the
+// generator carries a hand-maintained list, and a missing entry is a silent bug:
+// the field compiles as *T and callers simply have no way to clear it.
+//
+// This test pins the fields currently known to need Nullable[T]. If a schema
+// upgrade adds another, re-derive the list with:
+//
+//	codex app-server generate-ts --out /tmp/codex-ts --experimental
+//	grep -rl "null | null" /tmp/codex-ts
+func TestTriStateFieldsAreComplete(t *testing.T) {
+	// Each of these must be *Nullable[T], not a plain pointer.
+	assertNullable := func(name string, field any) {
+		t.Helper()
+		if _, ok := field.(*protocol.Nullable[string]); !ok {
+			t.Errorf("%s is %T, want *protocol.Nullable[string]: a plain pointer "+
+				"cannot express \"clear this value\"", name, field)
+		}
+	}
+
+	assertNullable("ThreadStartParams.ServiceTier", protocol.ThreadStartParams{}.ServiceTier)
+	assertNullable("ThreadResumeParams.ServiceTier", protocol.ThreadResumeParams{}.ServiceTier)
+	assertNullable("ThreadForkParams.ServiceTier", protocol.ThreadForkParams{}.ServiceTier)
+	assertNullable("TurnStartParams.ServiceTier", protocol.TurnStartParams{}.ServiceTier)
+	assertNullable("ThreadSettingsUpdateParams.ServiceTier", protocol.ThreadSettingsUpdateParams{}.ServiceTier)
+	assertNullable("ThreadRealtimeStartParams.Prompt", protocol.ThreadRealtimeStartParams{}.Prompt)
+}
