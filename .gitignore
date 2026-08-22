@@ -1,0 +1,19 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/dist/
+
+# Written by the generator when its output fails to parse, for inspection
+codex/protocol/*.broken
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
