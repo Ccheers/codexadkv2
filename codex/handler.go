@@ -120,6 +120,12 @@ type Handler struct {
 	// item. Append deltas in order.
 	OnCommandOutputDelta func(*protocol.CommandExecutionOutputDeltaNotification)
 
+	// OnFsChanged fires when a path under a registered fs/watch subscription
+	// changes. It only fires for watches a Client registered via FSWatch (or the
+	// workdir auto-subscription in StartThread); register a watch to begin
+	// receiving events.
+	OnFsChanged func(*protocol.FsChangedNotification)
+
 	// OnContextCompaction fires when the server compacts conversation history.
 	OnContextCompaction func(*protocol.ContextCompactedNotification)
 

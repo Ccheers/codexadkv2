@@ -233,3 +233,21 @@ func (c *Client) ModelList(ctx context.Context, params protocol.ModelListParams)
 	}
 	return &out, nil
 }
+
+// FSWatch subscribes to filesystem changes under path. It returns the canonical
+// path the server actually watches. Match the returned watchId against the
+// fs/changed events, and pass it to FSUnwatch to stop watching.
+func (c *Client) FSWatch(ctx context.Context, params protocol.FsWatchParams) (*protocol.FsWatchResponse, error) {
+	var out protocol.FsWatchResponse
+	if err := c.conn.Call(ctx, protocol.MethodFsWatch, params, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// FSUnwatch stops a subscription started by FSWatch or the workdir
+// auto-subscription in StartThread.
+func (c *Client) FSUnwatch(ctx context.Context, params protocol.FsUnwatchParams) error {
+	var out protocol.FsUnwatchResponse
+	return c.conn.Call(ctx, protocol.MethodFsUnwatch, params, &out)
+}

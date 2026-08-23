@@ -78,6 +78,11 @@ type Client struct {
 	mainMu      sync.Mutex
 	mainThread  *Thread
 	mainClaimed bool
+
+	// fsMu guards fsWatchIDs, the file-system watches this client has open. They
+	// are unwatched on Close.
+	fsMu       sync.Mutex
+	fsWatchIDs []string
 }
 
 // ErrMainThreadExists is returned by StartThread and ResumeThread when the client
@@ -257,6 +262,7 @@ func (c *Client) Notify(method string, params any) error {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		var errs []error
+		c.unwatchAll()
 		if c.conn != nil {
 			if err := c.conn.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				errs = append(errs, err)
@@ -275,6 +281,24 @@ func (c *Client) Close() error {
 		c.closeErr = errors.Join(errs...)
 	})
 	return c.closeErr
+}
+
+// unwatchAll best-effort closes every open fs/watch subscription before the
+// connection is torn down. Errors are ignored: the connection is closing anyway.
+func (c *Client) unwatchAll() {
+	c.fsMu.Lock()
+	ids := append([]string(nil), c.fsWatchIDs...)
+	c.fsWatchIDs = nil
+	c.fsMu.Unlock()
+
+	if len(ids) == 0 || c.conn == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, id := range ids {
+		_ = c.FSUnwatch(ctx, protocol.FsUnwatchParams{WatchID: id})
+	}
 }
 
 // Done returns a channel that is closed when the connection ends, carrying the

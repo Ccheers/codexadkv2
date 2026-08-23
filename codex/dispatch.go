@@ -227,6 +227,8 @@ func (d *dispatcher) invoke(n *notification) {
 		dispatch(d, n, h.OnReasoningTextDelta)
 	case protocol.NotifyItemCommandExecutionOutputDelta:
 		dispatch(d, n, h.OnCommandOutputDelta)
+	case protocol.NotifyFsChanged:
+		dispatch(d, n, h.OnFsChanged)
 	case protocol.NotifyThreadCompacted:
 		dispatch(d, n, h.OnContextCompaction)
 

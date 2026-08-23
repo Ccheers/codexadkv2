@@ -64,7 +64,34 @@ func (c *Client) StartThread(ctx context.Context, params protocol.ThreadStartPar
 	}
 	t := &Thread{client: c, id: out.Thread.ID, started: out}
 	c.setMainThread(t)
+	// Best-effort: a failed watch only disables OnFsChanged for the workdir, it
+	// never fails thread creation.
+	c.subscribeWorkdir(ctx, out.Cwd, out.Thread.ID)
 	return t, nil
+}
+
+// subscribeWorkdir watches the thread's resolved cwd so OnFsChanged fires for the
+// agent's working directory without the caller explicitly calling FSWatch. It is
+// best-effort: an error (for example the server rejecting the watch) is logged and
+// does not fail thread creation. The watchId is retained so Client.Close can
+// unwatch it.
+func (c *Client) subscribeWorkdir(ctx context.Context, cwd protocol.AbsolutePathBuf, threadID string) {
+	if cwd == "" || threadID == "" {
+		return
+	}
+
+	watchID := "workdir-" + threadID
+	if _, err := c.FSWatch(ctx, protocol.FsWatchParams{
+		Path:    cwd,
+		WatchID: watchID,
+	}); err != nil {
+		c.opts.logger.Warn("codex: could not auto-watch workdir; OnFsChanged will not fire for it",
+			"cwd", cwd, "error", err)
+		return
+	}
+	c.fsMu.Lock()
+	c.fsWatchIDs = append(c.fsWatchIDs, watchID)
+	c.fsMu.Unlock()
 }
 
 // ResumeThread reopens a stored thread as this client's main thread.
@@ -88,6 +115,9 @@ func (c *Client) ResumeThread(ctx context.Context, params protocol.ThreadResumeP
 	// the handle carries the start-shaped view for a uniform Info().
 	t := &Thread{client: c, id: out.Thread.ID, started: resumeToStart(out)}
 	c.setMainThread(t)
+	// Best-effort: a failed watch only disables OnFsChanged for the workdir, it
+	// never fails thread creation.
+	c.subscribeWorkdir(ctx, out.Cwd, out.Thread.ID)
 	return t, nil
 }
 

@@ -165,6 +165,97 @@ func TestNotificationsReachTypedCallbacks(t *testing.T) {
 	}
 }
 
+// TestStartThreadAutoWatchesWorkdir checks that starting a thread auto-subscribes
+// fs/watch on the thread's resolved cwd, and that a subsequent fs/changed reaches
+// OnFsChanged.
+func TestStartThreadAutoWatchesWorkdir(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread":         map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":          "gpt-5.6-terra",
+		"modelProvider":  "openai",
+		"cwd":            "/repo",
+		"approvalPolicy": "never",
+		"sandbox":        map[string]any{"type": "readOnly"},
+	})
+	srv.reply("fs/watch", map[string]any{"path": "/repo"})
+
+	var (
+		mu      sync.Mutex
+		changed []*protocol.FsChangedNotification
+	)
+
+	thread, err := newTestClient(t, srv, codex.WithHandler(codex.Handler{
+		OnFsChanged: func(n *protocol.FsChangedNotification) {
+			mu.Lock()
+			changed = append(changed, n)
+			mu.Unlock()
+		},
+	})).StartThread(context.Background(), protocol.ThreadStartParams{})
+	if err != nil {
+		t.Fatalf("StartThread: %v", err)
+	}
+	if thread.ID() != "thr_1" {
+		t.Fatalf("thread id = %q, want thr_1", thread.ID())
+	}
+
+	// StartThread answers fs/watch synchronously, so the request is recorded by
+	// the time it returns.
+	srv.waitForCall("fs/watch")
+	var watchParams protocol.FsWatchParams
+	if err := json.Unmarshal(srv.paramsFor("fs/watch"), &watchParams); err != nil {
+		t.Fatalf("fs/watch params: %v", err)
+	}
+	if watchParams.Path != "/repo" {
+		t.Errorf("fs/watch path = %q, want /repo", watchParams.Path)
+	}
+	if watchParams.WatchID != "workdir-thr_1" {
+		t.Errorf("fs/watch watchId = %q, want workdir-thr_1", watchParams.WatchID)
+	}
+
+	srv.notify(protocol.NotifyFsChanged, map[string]any{
+		"changedPaths": []string{"/repo/a.txt"},
+		"watchId":      "workdir-thr_1",
+	})
+	waitUntil(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(changed) == 1
+	}, "OnFsChanged did not receive the fs/changed notification")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := changed[0].WatchID; got != "workdir-thr_1" {
+		t.Errorf("onFsChanged watchId = %q, want workdir-thr_1", got)
+	}
+	if len(changed[0].ChangedPaths) != 1 || changed[0].ChangedPaths[0] != "/repo/a.txt" {
+		t.Errorf("onFsChanged changedPaths = %v, want [ /repo/a.txt ]", changed[0].ChangedPaths)
+	}
+}
+
+// TestStartThreadWorkdirWatchFailureIsNonFatal checks that a rejected fs/watch
+// only disables the convenience subscription, not thread creation.
+func TestStartThreadWorkdirWatchFailureIsNonFatal(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread":         map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":          "gpt-5.6-terra",
+		"modelProvider":  "openai",
+		"cwd":            "/repo",
+		"approvalPolicy": "never",
+		"sandbox":        map[string]any{"type": "readOnly"},
+	})
+	srv.replyError("fs/watch", -32000, "watches are disabled")
+
+	thread, err := newTestClient(t, srv).StartThread(context.Background(), protocol.ThreadStartParams{})
+	if err != nil {
+		t.Fatalf("StartThread returned an error despite a failed fs/watch: %v", err)
+	}
+	if thread.ID() != "thr_1" {
+		t.Errorf("thread id = %q, want thr_1", thread.ID())
+	}
+}
+
 // TestUnknownNotificationReachesOnUnhandled is the forward-compatibility path: a
 // method from a newer server must surface, not vanish.
 func TestUnknownNotificationReachesOnUnhandled(t *testing.T) {
