@@ -175,6 +175,22 @@ type Handler struct {
 	// input or confirmation of a URL flow. If nil, the SDK declines.
 	OnElicitation func(*protocol.MCPServerElicitationRequestParams) (*protocol.MCPServerElicitationRequestResponse, error)
 
+	// OnDynamicToolCall executes a dynamic tool the model invoked.
+	//
+	// Dynamic tools are registered on the thread (thread/start.dynamicTools), and
+	// the server calls back here to have the client run one. The turn is blocked
+	// until this returns, so a long-running tool holds the turn open, which is
+	// intended.
+	//
+	// Most callers should not set this: codex.Open's WithTools and WithToolGroups
+	// register typed tools and route calls to them automatically. Set it only to
+	// handle dispatch yourself, in which case it takes precedence over the
+	// registry.
+	//
+	// If neither this nor a registered tool handles a call, the SDK answers with a
+	// failed tool call rather than leaving the turn blocked.
+	OnDynamicToolCall func(*protocol.DynamicToolCallParams) (*protocol.DynamicToolCallResponse, error)
+
 	// OnUnhandledRequest receives any server-initiated request with no specific
 	// callback.
 	//

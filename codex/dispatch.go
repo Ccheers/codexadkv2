@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,14 @@ type dispatcher struct {
 	handler *Handler
 	logger  *slog.Logger
 	bufSize int
+
+	// tools resolves dynamic tool calls to their handlers. It is set once, before
+	// Serve starts, by the session that registered the tools.
+	tools *toolRegistry
+
+	// sessionCtx is the context tool calls run under, so closing the session
+	// cancels work still in flight inside a tool.
+	sessionCtx context.Context
 
 	// conn is set immediately after construction, before Serve starts.
 	conn *jsonrpc.Conn
@@ -378,6 +387,41 @@ func (d *dispatcher) answer(method string, params json.RawMessage, respond func(
 		}
 		respond(out, nil)
 
+	case protocol.ServerMethodItemToolCall:
+		var p protocol.DynamicToolCallParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			d.logDecodeFailure(method, err)
+			respond(failedToolCall("client could not decode the tool call: "+err.Error()), nil)
+			return
+		}
+
+		// An explicit handler wins, so a caller can take over dispatch entirely.
+		if h.OnDynamicToolCall != nil {
+			out, err := h.OnDynamicToolCall(&p)
+			if err != nil {
+				respond(failedToolCall(err.Error()), nil)
+				return
+			}
+			if out == nil {
+				respond(failedToolCall("the tool handler returned no result"), nil)
+				return
+			}
+			respond(out, nil)
+			return
+		}
+
+		if d.tools == nil {
+			d.logger.Warn("codex: the model called a dynamic tool but none are registered; "+
+				"reporting a failed tool call. Register tools with codex.WithTools, "+
+				"or handle dispatch with Handler.OnDynamicToolCall",
+				"tool", p.Tool)
+			respond(failedToolCall("this client has no dynamic tools registered"), nil)
+			return
+		}
+		// The context is the session's, so closing the session cancels in-flight
+		// tool calls rather than letting them outlive it.
+		respond(d.tools.dispatchToolCall(d.toolContext(), &p), nil)
+
 	case protocol.ServerMethodMcpServerElicitationRequest:
 		var p protocol.MCPServerElicitationRequestParams
 		if err := json.Unmarshal(params, &p); err != nil {
@@ -424,6 +468,28 @@ func declineCommand() *protocol.CommandExecutionRequestApprovalResponse {
 func declineFileChange() *protocol.FileChangeRequestApprovalResponse {
 	d := protocol.NewFileChangeApprovalDecisionDecline()
 	return &protocol.FileChangeRequestApprovalResponse{Decision: &d}
+}
+
+// toolContext returns the context dynamic tool calls run under.
+//
+// Tool calls arrive on their own goroutine and may run as long as the work takes,
+// so they need a context that outlives any single request but dies with the
+// session.
+func (d *dispatcher) toolContext() context.Context {
+	d.mu.Lock()
+	ctx := d.sessionCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// setSessionContext records the context dynamic tool calls should run under.
+func (d *dispatcher) setSessionContext(ctx context.Context) {
+	d.mu.Lock()
+	d.sessionCtx = ctx
+	d.mu.Unlock()
 }
 
 func (d *dispatcher) warnNoHandler(method, field string) {

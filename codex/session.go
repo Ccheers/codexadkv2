@@ -63,6 +63,9 @@ type sessionConfig struct {
 	clientOpts []Option
 	threadOpts []protocol.ThreadStartParamsOption
 	params     *protocol.ThreadStartParams
+
+	tools      []DynamicTool
+	toolGroups []ToolGroup
 }
 
 // WithClientOptions passes options through to the underlying Client.
@@ -93,6 +96,48 @@ func WithThreadParams(params protocol.ThreadStartParams) SessionOption {
 	return sessionOptionFunc(func(c *sessionConfig) { c.params = &params })
 }
 
+// WithTools exposes tools to the model for the life of the session.
+//
+// The session builds the thread's dynamicTools spec, answers tool calls by
+// running the matching tool, and returns its result to the model. Nothing else is
+// required: there is no separate callback to register and no dispatch to write.
+//
+//	session, err := codex.Open(ctx,
+//	    codex.WithTools(grepTool, readFileTool),
+//	)
+//
+// Dynamic tools are an experimental app-server feature, so Open enables the
+// experimental capability automatically when any tool is registered. The server
+// rejects dynamicTools without it, and requiring callers to remember
+// WithExperimentalAPI would turn that into a confusing runtime error.
+//
+// These become top-level tools. Use WithToolGroups to nest related tools under a
+// shared name.
+func WithTools(tools ...DynamicTool) SessionOption {
+	return sessionOptionFunc(func(c *sessionConfig) {
+		c.tools = append(c.tools, tools...)
+	})
+}
+
+// WithToolGroups exposes groups of related tools to the model.
+//
+// A group is a progressive-disclosure step: the model reads the group's
+// description first and only looks at the tools inside if the area seems
+// relevant. That keeps a large tool surface from crowding out the conversation.
+//
+//	codex.WithToolGroups(codex.ToolGroup{
+//	    Name:        "db",
+//	    Description: "Inspect and query the application database",
+//	    Tools:       []codex.DynamicTool{queryTool, schemaTool},
+//	})
+//
+// Like WithTools, this enables the experimental capability automatically.
+func WithToolGroups(groups ...ToolGroup) SessionOption {
+	return sessionOptionFunc(func(c *sessionConfig) {
+		c.toolGroups = append(c.toolGroups, groups...)
+	})
+}
+
 // Open starts an app-server, completes the handshake, and starts one thread.
 //
 //	session, err := codex.Open(ctx,
@@ -113,7 +158,24 @@ func Open(ctx context.Context, opts ...SessionOption) (*Session, error) {
 		}
 	}
 
-	client, err := New(ctx, cfg.clientOpts...)
+	// Validate the tools before spawning anything: a duplicate or undescribed tool
+	// is a programming error, and reporting it without having started a server
+	// first keeps the failure cheap and the message clear.
+	registry, err := buildToolRegistry(cfg.tools, cfg.toolGroups)
+	if err != nil {
+		return nil, err
+	}
+	hasTools := len(registry.specs) > 0
+
+	clientOpts := cfg.clientOpts
+	if hasTools {
+		// dynamicTools is experimental-gated, and the server rejects it outright
+		// without the capability. Enabling it here beats making the caller pair two
+		// options correctly to avoid a confusing rejection.
+		clientOpts = append(clientOpts, WithExperimentalAPI())
+	}
+
+	client, err := New(ctx, clientOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +183,13 @@ func Open(ctx context.Context, opts ...SessionOption) (*Session, error) {
 	params := protocol.NewThreadStartParams(cfg.threadOpts...)
 	if cfg.params != nil {
 		params = *cfg.params
+	}
+	if hasTools {
+		params.DynamicTools = registry.specs
+		client.dispatch.tools = registry
+		// Tool calls run under the session's context, so closing the session
+		// cancels work still inside a tool.
+		client.dispatch.setSessionContext(ctx)
 	}
 
 	thread, err := client.StartThread(ctx, params)

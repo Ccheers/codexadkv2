@@ -23,7 +23,7 @@ fmt.Println(result.AgentMessage)
 
 - Go 1.23+ (uses range-over-func iterators)
 - The [Codex CLI](https://learn.chatgpt.com/docs/codex) on `PATH`, authenticated
-- No third-party dependencies — stdlib only
+- One dependency: `github.com/invopop/jsonschema`, for reflecting tool argument schemas
 
 ## Install
 
@@ -169,6 +169,41 @@ thread, err := client.StartThread(ctx, protocol.ThreadStartParams{
     Sandbox:        &sandbox,
 })
 ```
+
+## Dynamic tools
+
+Expose Go functions to the model. The session registers them at thread start, answers tool calls by running the matching handler, and returns the result — no callback to wire up, no dispatch to write.
+
+```go
+type GrepArgs struct {
+    Pattern string `json:"pattern" jsonschema:"description=regular expression to match"`
+    Path    string `json:"path,omitempty" jsonschema:"description=directory to search"`
+}
+
+grep := codex.NewTool("grep", "Search repo files by regular expression",
+    func(ctx context.Context, callID string, a GrepArgs) (string, error) {
+        return runGrep(ctx, a.Pattern, a.Path)
+    })
+
+session, err := codex.Open(ctx,
+    codex.WithTools(grep),
+    codex.WithToolGroups(codex.ToolGroup{
+        Name:        "inventory",
+        Description: "Read and update the warehouse inventory held by this program",
+        Tools:       []codex.DynamicTool{checkTool, restockTool},
+    }),
+)
+```
+
+The input schema is reflected from the `Args` type. **A field is required unless its json tag has `omitempty`** — the opposite of what most people expect, and it changes how the model calls your tool, so mark optional arguments explicitly.
+
+**Groups are progressive disclosure.** The model reads the group's `Description` to decide whether the area is relevant, and only then looks at the tools inside. That description is load-bearing, which is why it belongs to the group rather than being derived from its tools. A tool carries no namespace of its own, so the same instance can be registered standalone in one session and inside a group in another.
+
+**Return an error, not an error string.** A non-nil error becomes a failed tool call with your message as the reason, and the model can act on it. Observed live: an agent called `check("sprockets")`, got back `no such item "sprockets"; known items are widget, gizmo, sprocket`, and retried with the singular form.
+
+Dynamic tools are experimental, so `Open` enables the capability automatically when any tool is registered — the server rejects `dynamicTools` without it. Registration mistakes (duplicate names, a group with no description) fail at `Open` before a server is spawned, rather than mid-turn.
+
+Run `go run ./examples/tools` to see it work.
 
 ## Errors
 
