@@ -4,12 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -95,7 +92,7 @@ func StartProcess(cfg ProcessConfig) (*Process, error) {
 			config.Path, err)
 	}
 
-	cmd := exec.Command(resolved, config.Args...)
+	cmd := newCmd(resolved, config.Args)
 	cmd.Dir = config.Dir
 	cmd.Env = config.Env
 
@@ -284,51 +281,4 @@ func (s *stderrTail) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.TrimSpace(string(s.buf))
-}
-
-// configureProcessGroup places the child in its own process group where the OS
-// supports it, so signals reach the whole tree.
-func configureProcessGroup(cmd *exec.Cmd) {
-	if runtime.GOOS == "windows" {
-		return
-	}
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
-}
-
-// terminateGroup asks the child and its descendants to exit.
-//
-// On Windows there is no SIGTERM: Process.Kill is the only option, so the
-// graceful step is skipped there and orphaned grandchildren are possible. A
-// full fix needs a Job Object or taskkill /T, which is not implemented.
-func terminateGroup(cmd *exec.Cmd) {
-	if cmd.Process == nil {
-		return
-	}
-	if runtime.GOOS == "windows" {
-		_ = cmd.Process.Kill()
-		return
-	}
-	if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil && pgid == cmd.Process.Pid {
-		if err := syscall.Kill(-pgid, syscall.SIGTERM); err == nil {
-			return
-		}
-	}
-	_ = cmd.Process.Signal(os.Interrupt)
-}
-
-func killGroup(cmd *exec.Cmd) {
-	if cmd.Process == nil {
-		return
-	}
-	if runtime.GOOS != "windows" {
-		if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil && pgid == cmd.Process.Pid {
-			if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil {
-				return
-			}
-		}
-	}
-	_ = cmd.Process.Kill()
 }
