@@ -20,6 +20,22 @@ import subprocess
 import sys
 from pathlib import Path
 
+# When set, file comparisons read the baseline from this git ref instead of the
+# pristine working tree, so later commits are not blamed on the runs.
+BASELINE_REF = None
+
+
+def baseline_bytes(pristine, rel):
+    """Read a file from the pinned baseline ref, or the working tree."""
+    if BASELINE_REF:
+        result = subprocess.run(
+            ["git", "-C", str(pristine), "show", f"{BASELINE_REF}:{rel}"],
+            capture_output=True,
+        )
+        return result.stdout if result.returncode == 0 else None
+    p = Path(pristine) / rel
+    return p.read_bytes() if p.exists() else None
+
 EVAL_DIRS = {
     1: "eval-1-regenerate-integrate",
     2: "eval-2-wrap-existing",
@@ -64,6 +80,13 @@ def file_differs(run, pristine, rel):
 
 
 def dir_differs(run, pristine, reldir, exclude=()):
+    """List files under reldir that differ from the pristine baseline.
+
+    The baseline must be the repo state the runs were COPIED FROM, not current
+    HEAD. If the real repo moves on while evals are in flight, comparing against
+    HEAD reports the repo's own later commits as edits made by the run. Pass
+    --baseline-ref to pin it.
+    """
     a = Path(run) / "repo" / reldir
     b = Path(pristine) / reldir
     if not a.exists():
@@ -75,8 +98,8 @@ def dir_differs(run, pristine, reldir, exclude=()):
         rel = f.relative_to(a)
         if any(str(rel).startswith(e) for e in exclude):
             continue
-        other = b / rel
-        if not other.exists() or other.read_bytes() != f.read_bytes():
+        base = baseline_bytes(pristine, str(Path(reldir) / rel))
+        if base is None or base != f.read_bytes():
             changed.append(str(rel))
     return changed
 
@@ -225,7 +248,8 @@ def grade_eval3(run, pristine):
                 else "does not name the specific field"))
 
     exp_go = repo_file(run, "internal/cmd/schemagen/experimental.go")
-    pristine_exp = read(Path(pristine) / "internal/cmd/schemagen/experimental.go")
+    base = baseline_bytes(pristine, "internal/cmd/schemagen/experimental.go")
+    pristine_exp = base.decode("utf-8", "replace") if base else ""
     guard_intact = exp_go.strip() == pristine_exp.strip()
     res.append(("3d", guard_intact,
                 "the strict-superset check is untouched" if guard_intact
@@ -269,6 +293,14 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     iteration, pristine = sys.argv[1], sys.argv[2]
+
+    # Pin the baseline to the commit the runs were copied from. Without this, any
+    # commit landing in the real repo mid-eval is misattributed to every run.
+    baseline_ref = sys.argv[3] if len(sys.argv) > 3 else None
+    if baseline_ref:
+        global BASELINE_REF
+        BASELINE_REF = baseline_ref
+        print(f"grading against baseline ref {baseline_ref}")
 
     for eval_id, dirname in EVAL_DIRS.items():
         meta_path = Path(iteration) / dirname / "eval_metadata.json"

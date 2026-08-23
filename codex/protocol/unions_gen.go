@@ -33,6 +33,20 @@ func marshalTagged(tagKey, tagValue string, payload any) ([]byte, error) {
 	return json.Marshal(fields)
 }
 
+// Ptr returns a pointer to v.
+//
+// Optional fields are pointers so that absent is distinguishable from zero, and
+// Go has no way to take the address of a literal. Ptr closes that gap:
+//
+//	params := protocol.ThreadStartParams{
+//	    Cwd:     protocol.Ptr("/repo"),
+//	    Sandbox: protocol.Ptr(protocol.SandboxModeReadOnly),
+//	}
+//
+// The New* constructors and With* options in options_gen.go do this for you, so
+// reach for Ptr when a struct literal reads better than a constructor call.
+func Ptr[T any](v T) *T { return &v }
+
 // Nullable distinguishes three states for a field where the protocol treats
 // "absent" and "explicit null" differently: absent leaves the server's current
 // value unchanged, while null clears it.

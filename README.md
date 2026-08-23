@@ -178,6 +178,37 @@ for thread, err := range client.ListThreads(ctx, protocol.ThreadListParams{}) {
 
 All ~950 protocol types are generated into `codex/protocol` and committed, so `go get` needs no codegen step and no `codex` binary.
 
+**Constructors and options.** Every generated struct has a `New<Type>` constructor plus `With<Type><Field>` options. Required fields are positional arguments, so the compiler catches a missing one; optional fields are options that take plain values and handle the pointer-taking for you:
+
+```go
+params := protocol.NewTurnStartParams(input, "thr_1",
+    protocol.WithTurnStartParamsModel("gpt-5.6-terra"),
+    protocol.WithTurnStartParamsCwd("/repo"),
+)
+```
+
+Option names are type-prefixed because Go has no per-type function namespace and dozens of types share field names like `Model` and `Cwd`. Options are values, so a house style can be built once and reused:
+
+```go
+base := []protocol.ThreadStartParamsOption{
+    protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+    protocol.WithThreadStartParamsApprovalPolicy(protocol.NewAskForApprovalNever()),
+}
+thread := protocol.NewThreadStartParams(append(base, protocol.WithThreadStartParamsCwd("/repo"))...)
+```
+
+Structs stay plain structs — a literal still works, and `protocol.Ptr` covers the cases where that reads better:
+
+```go
+params := protocol.ThreadStartParams{Cwd: protocol.Ptr("/repo")}
+```
+
+**Enums** are string-typed constants with the wire value verbatim, plus `IsKnown()`:
+
+```go
+protocol.SandboxModeReadOnly  // SandboxMode = "read-only"
+```
+
 **Unions** are one struct with a discriminant plus typed accessors:
 
 ```go
@@ -197,9 +228,16 @@ Marshaling is driven strictly by the discriminant, so a struct whose tag and pay
 **Tri-state fields.** Five fields distinguish "absent" from "explicitly null", where absent leaves the server's value alone and null clears it:
 
 ```go
-params.ServiceTier = protocol.Value("flex") // set
-params.ServiceTier = protocol.Null[string]() // clear
+params.ServiceTier = protocol.Value("flex")  // set
+params.ServiceTier = protocol.Null[string]() // clear it server-side
 params.ServiceTier = nil                     // leave unchanged
+```
+
+Via options, the third state is the absence of an option and clearing has its own:
+
+```go
+protocol.WithTurnStartParamsServiceTier("flex") // set
+protocol.ClearTurnStartParamsServiceTier()      // clear it server-side
 ```
 
 ## Experimental API

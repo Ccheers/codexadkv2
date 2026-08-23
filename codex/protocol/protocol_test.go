@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/ccheers/codexadkv2/codex/protocol"
@@ -316,4 +317,151 @@ func TestTriStateFieldsAreComplete(t *testing.T) {
 	assertNullable("TurnStartParams.ServiceTier", protocol.TurnStartParams{}.ServiceTier)
 	assertNullable("ThreadSettingsUpdateParams.ServiceTier", protocol.ThreadSettingsUpdateParams{}.ServiceTier)
 	assertNullable("ThreadRealtimeStartParams.Prompt", protocol.ThreadRealtimeStartParams{}.Prompt)
+}
+
+// TestConstructorRequiredFields checks that the required fields the schema
+// declares become positional constructor arguments, so they cannot be omitted.
+func TestConstructorRequiredFields(t *testing.T) {
+	input := []*protocol.UserInput{protocol.Ptr(protocol.NewUserInputText(
+		protocol.UserInputTextPayload{Text: "hi"}))}
+
+	// The signature itself is the assertion: this will not compile if threadId
+	// and input stop being required, or if the argument order changes.
+	p := protocol.NewTurnStartParams(input, "thr_1")
+
+	if p.ThreadID != "thr_1" {
+		t.Errorf("ThreadID = %q, want thr_1", p.ThreadID)
+	}
+	if len(p.Input) != 1 {
+		t.Fatalf("Input has %d items, want 1", len(p.Input))
+	}
+	// An unset optional field must stay nil so it is omitted on the wire.
+	if p.Model != nil {
+		t.Errorf("Model = %v, want nil when no option set it", p.Model)
+	}
+}
+
+// TestOptionsSetOptionalFields covers the ergonomic win: options take plain
+// values, not pointers, so no temporary variable is needed to take an address.
+func TestOptionsSetOptionalFields(t *testing.T) {
+	p := protocol.NewTurnStartParams(nil, "thr_1",
+		protocol.WithTurnStartParamsModel("gpt-5.6-terra"),
+		protocol.WithTurnStartParamsCwd("/repo"),
+		protocol.WithTurnStartParamsEffort("high"),
+	)
+
+	if p.Model == nil || *p.Model != "gpt-5.6-terra" {
+		t.Errorf("Model = %v, want gpt-5.6-terra", p.Model)
+	}
+	if p.Cwd == nil || *p.Cwd != "/repo" {
+		t.Errorf("Cwd = %v, want /repo", p.Cwd)
+	}
+	if p.Effort == nil || *p.Effort != "high" {
+		t.Errorf("Effort = %v, want high", p.Effort)
+	}
+}
+
+// TestOptionsProduceCorrectWireShape is the assertion that matters most: the
+// convenience layer must serialize identically to a hand-built literal.
+func TestOptionsProduceCorrectWireShape(t *testing.T) {
+	viaOptions := protocol.NewThreadStartParams(
+		protocol.WithThreadStartParamsCwd("/repo"),
+		protocol.WithThreadStartParamsSandbox(protocol.SandboxModeWorkspaceWrite),
+	)
+	viaLiteral := protocol.ThreadStartParams{
+		Cwd:     protocol.Ptr("/repo"),
+		Sandbox: protocol.Ptr(protocol.SandboxModeWorkspaceWrite),
+	}
+
+	a, err := json.Marshal(viaOptions)
+	if err != nil {
+		t.Fatalf("marshal options form: %v", err)
+	}
+	b, err := json.Marshal(viaLiteral)
+	if err != nil {
+		t.Fatalf("marshal literal form: %v", err)
+	}
+	if string(a) != string(b) {
+		t.Errorf("options and literal disagree:\n options: %s\n literal: %s", a, b)
+	}
+	// And the kebab-case wire value must survive the option path.
+	if !strings.Contains(string(a), `"sandbox":"workspace-write"`) {
+		t.Errorf("sandbox wire value wrong: %s", a)
+	}
+}
+
+// TestTriStateOptionsExpressAllThreeStates verifies the reason tri-state fields
+// get two options instead of one.
+func TestTriStateOptionsExpressAllThreeStates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []protocol.TurnStartParamsOption
+		want string
+	}{
+		{"absent leaves it unchanged", nil, `{"threadId":"t","input":null}`},
+		{
+			"explicit null clears it",
+			[]protocol.TurnStartParamsOption{protocol.ClearTurnStartParamsServiceTier()},
+			`{"threadId":"t","input":null,"serviceTier":null}`,
+		},
+		{
+			"a value sets it",
+			[]protocol.TurnStartParamsOption{protocol.WithTurnStartParamsServiceTier("flex")},
+			`{"threadId":"t","input":null,"serviceTier":"flex"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := protocol.NewTurnStartParams(nil, "t", tc.opts...)
+			got, err := json.Marshal(p)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			assertJSONEqualBytes(t, got, tc.want)
+		})
+	}
+}
+
+// TestOptionsAreComposable confirms options can be built up and reused, which is
+// why they are functions rather than methods on the struct.
+func TestOptionsAreComposable(t *testing.T) {
+	// A house style every thread in a program should share.
+	base := []protocol.ThreadStartParamsOption{
+		protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+		protocol.WithThreadStartParamsApprovalPolicy(protocol.NewAskForApprovalNever()),
+	}
+
+	a := protocol.NewThreadStartParams(append(base, protocol.WithThreadStartParamsCwd("/a"))...)
+	b := protocol.NewThreadStartParams(append(base, protocol.WithThreadStartParamsCwd("/b"))...)
+
+	if a.Cwd == nil || *a.Cwd != "/a" || b.Cwd == nil || *b.Cwd != "/b" {
+		t.Fatalf("cwd not applied per call: a=%v b=%v", a.Cwd, b.Cwd)
+	}
+	// The shared options must apply to both without one call leaking into the other.
+	for name, p := range map[string]protocol.ThreadStartParams{"a": a, "b": b} {
+		if p.Sandbox == nil || *p.Sandbox != protocol.SandboxModeReadOnly {
+			t.Errorf("%s: Sandbox = %v, want read-only", name, p.Sandbox)
+		}
+	}
+}
+
+// TestUnionPayloadsHaveConstructors checks the option layer reaches union payload
+// structs too, not just top-level params.
+func TestUnionPayloadsHaveConstructors(t *testing.T) {
+	payload := protocol.NewSandboxPolicyWorkspaceWritePayload(
+		protocol.WithSandboxPolicyWorkspaceWritePayloadNetworkAccess(true),
+		protocol.WithSandboxPolicyWorkspaceWritePayloadWritableRoots(
+			[]protocol.AbsolutePathBuf{"/repo"}),
+	)
+	policy := protocol.NewSandboxPolicyWorkspaceWrite(payload)
+
+	ww, ok := policy.AsWorkspaceWrite()
+	if !ok {
+		t.Fatal("AsWorkspaceWrite returned false")
+	}
+	if ww.NetworkAccess == nil || !*ww.NetworkAccess {
+		t.Errorf("NetworkAccess = %v, want true", ww.NetworkAccess)
+	}
+	if len(ww.WritableRoots) != 1 {
+		t.Errorf("WritableRoots = %v, want one entry", ww.WritableRoots)
+	}
 }

@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
 	"sync"
 	"time"
 
@@ -251,8 +252,12 @@ type options struct {
 }
 
 func defaultOptions() options {
+	binaryPath := "codex"
+	if runtime.GOOS == "windows" {
+		binaryPath = "codex.exe"
+	}
 	return options{
-		binaryPath: "codex",
+		binaryPath: binaryPath,
 		args:       []string{"app-server"},
 
 		// A client name is required for the server to attribute usage. The
@@ -264,7 +269,7 @@ func defaultOptions() options {
 		handler: &Handler{},
 		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 
-		notificationBuffer: 256,
+		notificationBuffer: 1024,
 		handshakeTimeout:   30 * time.Second,
 		shutdownGrace:      5 * time.Second,
 		killGrace:          2 * time.Second,

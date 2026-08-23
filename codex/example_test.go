@@ -201,3 +201,40 @@ func ExampleClient_Call() {
 		log.Fatal(err)
 	}
 }
+
+// ExampleNewTurnStartParams shows the constructor-and-options form. Required
+// fields are positional, so a missing one is a compile error; optional fields
+// take plain values rather than pointers.
+func ExampleNewTurnStartParams() {
+	params := protocol.NewTurnStartParams(
+		[]*protocol.UserInput{codex.TextInput("Run the tests.")},
+		"thr_1",
+		protocol.WithTurnStartParamsModel("gpt-5.6-terra"),
+		protocol.WithTurnStartParamsCwd("/repo"),
+		protocol.WithTurnStartParamsSandboxPolicy(
+			protocol.NewSandboxPolicyWorkspaceWrite(
+				protocol.NewSandboxPolicyWorkspaceWritePayload(
+					protocol.WithSandboxPolicyWorkspaceWritePayloadWritableRoots(
+						[]protocol.AbsolutePathBuf{"/repo"}),
+				))),
+	)
+	fmt.Println(params.ThreadID, *params.Model)
+	// Output: thr_1 gpt-5.6-terra
+}
+
+// ExampleThreadStartParamsOption shows that options are values, so a shared
+// house style can be built once and applied to many calls.
+func ExampleThreadStartParamsOption() {
+	base := []protocol.ThreadStartParamsOption{
+		protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+		protocol.WithThreadStartParamsApprovalPolicy(protocol.NewAskForApprovalNever()),
+	}
+
+	frontend := protocol.NewThreadStartParams(
+		append(base, protocol.WithThreadStartParamsCwd("/repo/web"))...)
+	backend := protocol.NewThreadStartParams(
+		append(base, protocol.WithThreadStartParamsCwd("/repo/api"))...)
+
+	fmt.Println(*frontend.Cwd, *backend.Cwd, *frontend.Sandbox)
+	// Output: /repo/web /repo/api read-only
+}

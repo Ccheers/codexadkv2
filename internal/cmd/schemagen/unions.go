@@ -27,6 +27,7 @@ func (g *generator) emitUnions(b *bytes.Buffer, names []string) error {
 	b.WriteString("import (\n\t\"encoding/json\"\n\t\"fmt\"\n)\n\n")
 	b.WriteString(strings.TrimSpace(unionHelpers))
 	b.WriteString("\n\n")
+	g.emitPtr(b)
 	g.emitNullable(b)
 
 	for _, name := range names {
@@ -39,6 +40,30 @@ func (g *generator) emitUnions(b *bytes.Buffer, names []string) error {
 		}
 	}
 	return nil
+}
+
+// emitPtr writes the generic pointer helper.
+//
+// Most optional fields are pointers so that "unset" is representable, which
+// otherwise forces callers into a temporary variable just to take an address.
+// The With* options avoid this for the constructor path; Ptr covers the cases
+// where a plain struct literal is still the clearest way to write something.
+func (g *generator) emitPtr(b *bytes.Buffer) {
+	b.WriteString(`// Ptr returns a pointer to v.
+//
+// Optional fields are pointers so that absent is distinguishable from zero, and
+// Go has no way to take the address of a literal. Ptr closes that gap:
+//
+//	params := protocol.ThreadStartParams{
+//	    Cwd:     protocol.Ptr("/repo"),
+//	    Sandbox: protocol.Ptr(protocol.SandboxModeReadOnly),
+//	}
+//
+// The New* constructors and With* options in options_gen.go do this for you, so
+// reach for Ptr when a struct literal reads better than a constructor call.
+func Ptr[T any](v T) *T { return &v }
+
+`)
 }
 
 // emitNullable writes the tri-state wrapper. Five fields in the protocol are
