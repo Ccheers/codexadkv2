@@ -16,16 +16,67 @@ import (
 	"github.com/ccheers/codexadkv2/internal/jsonrpc"
 )
 
-// Example is the shortest useful program: start a thread, run one turn, print
-// the reply.
+// Example is the shortest useful program: open a session, run one turn, print the
+// reply. Open spawns the server, handshakes, and starts the thread in one call.
 func Example() {
 	ctx := context.Background()
 
-	client, err := codex.New(ctx,
+	session, err := codex.Open(ctx,
 		codex.WithClientInfo("my_product", "My Product", "1.0.0"))
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer session.Close()
+
+	result, err := session.RunText(ctx, "Summarize this repo.")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(result.AgentMessage)
+}
+
+// ExampleOpen configures both the client and its thread in one call.
+func ExampleOpen() {
+	ctx := context.Background()
+
+	session, err := codex.Open(ctx,
+		codex.WithClientInfo("my_product", "My Product", "1.0.0"),
+		codex.WithHandler(codex.Handler{
+			OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
+				fmt.Print(n.Delta)
+			},
+		}),
+		codex.WithThreadOptions(
+			protocol.WithThreadStartParamsCwd("/repo"),
+			protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+		),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer session.Close()
+
+	if _, err := session.RunText(ctx, "Run the tests."); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// ExampleThread_Run prints the agent's reply as it streams, then reads the final
+// result. Streaming and completion are the same mechanism: callbacks fire while
+// Run is blocked.
+func ExampleThread_Run() {
+	ctx := context.Background()
+
+	client, _ := codex.New(ctx, codex.WithHandler(codex.Handler{
+		OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
+			fmt.Print(n.Delta)
+		},
+		OnItemStarted: func(n *protocol.ItemStartedNotification) {
+			if cmd, ok := n.Item.AsCommandExecution(); ok {
+				fmt.Fprintf(os.Stderr, "$ %s\n", cmd.Command)
+			}
+		},
+	}))
 	defer client.Close()
 
 	thread, err := client.StartThread(ctx, protocol.ThreadStartParams{})
@@ -33,42 +84,11 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	result, err := thread.RunText(ctx, "Summarize this repo.")
+	result, err := thread.RunText(ctx, "List the files here.")
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(result.AgentMessage)
-}
-
-// ExampleThread_RunStream prints the agent's reply as it arrives and reports
-// commands as they start.
-func ExampleThread_RunStream() {
-	ctx := context.Background()
-	client, _ := codex.New(ctx)
-	defer client.Close()
-	thread, _ := client.StartThread(ctx, protocol.ThreadStartParams{})
-
-	stream, err := thread.RunStream(ctx, protocol.TurnStartParams{
-		Input: []*protocol.UserInput{codex.TextInput("List the files here.")},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for ev := range stream.Events() {
-		switch ev.Kind {
-		case codex.EventAgentMessageDelta:
-			fmt.Print(ev.Delta)
-		case codex.EventItemStarted:
-			if cmd, ok := ev.Item.AsCommandExecution(); ok {
-				fmt.Fprintf(os.Stderr, "$ %s\n", cmd.Command)
-			}
-		}
-	}
-
-	if _, err := stream.Result(); err != nil {
-		log.Fatal(err)
-	}
+	fmt.Fprintf(os.Stderr, "\nturn %s\n", result.Status())
 }
 
 // ExampleWithHandler registers notification callbacks.

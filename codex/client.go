@@ -69,6 +69,63 @@ type Client struct {
 	serveErr  chan error
 	closeOnce sync.Once
 	closeErr  error
+
+	// mainThread is the single thread this client drives. One client to one main
+	// thread keeps handler routing unambiguous: a callback firing for this
+	// client's own work is the common case, and anything else is a thread the
+	// server created (a sub-agent, a review, a compaction) which the caller can
+	// recognize by its threadId.
+	mainMu      sync.Mutex
+	mainThread  *Thread
+	mainClaimed bool
+}
+
+// ErrMainThreadExists is returned by StartThread and ResumeThread when the client
+// already drives a main thread.
+//
+// The SDK models one client per conversation. Sharing one client across several
+// caller-driven threads would make every callback ambiguous about which
+// conversation it belongs to, and would tie unrelated conversations to a shared
+// notification queue and a shared process lifetime.
+var ErrMainThreadExists = errors.New(
+	"codex: this client already has a main thread; create another client for another conversation")
+
+// claimMainThread reserves the main-thread slot before the request goes out, so
+// two concurrent StartThread calls cannot both succeed.
+func (c *Client) claimMainThread() error {
+	c.mainMu.Lock()
+	defer c.mainMu.Unlock()
+	if c.mainClaimed {
+		return ErrMainThreadExists
+	}
+	c.mainClaimed = true
+	return nil
+}
+
+// releaseMainThread returns the slot after a failed start, so a transient error
+// does not permanently disable the client.
+func (c *Client) releaseMainThread() {
+	c.mainMu.Lock()
+	defer c.mainMu.Unlock()
+	c.mainClaimed = false
+	c.mainThread = nil
+}
+
+func (c *Client) setMainThread(t *Thread) {
+	c.mainMu.Lock()
+	defer c.mainMu.Unlock()
+	c.mainThread = t
+}
+
+// MainThread returns the thread this client drives, or nil before StartThread or
+// ResumeThread has succeeded.
+//
+// It saves threading a *Thread through call sites that already hold the client,
+// which is common inside notification callbacks.
+func (c *Client) MainThread() *Thread {
+	c.mainMu.Lock()
+	defer c.mainMu.Unlock()
+	return c.mainThread
 }
 
 // New starts an app-server, completes the initialize handshake, and returns a

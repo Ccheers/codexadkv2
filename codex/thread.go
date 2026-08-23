@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ccheers/codexadkv2/codex/protocol"
 )
@@ -24,6 +25,12 @@ type Thread struct {
 
 	id      string
 	started *protocol.ThreadStartResponse
+
+	// currentTurn is the turn Run is currently blocked on, so a caller on another
+	// goroutine can steer or interrupt it without having to capture the id from an
+	// OnTurnStarted callback.
+	turnMu      sync.Mutex
+	currentTurn string
 }
 
 // ID returns the thread id.
@@ -33,41 +40,64 @@ func (t *Thread) ID() string { return t.id }
 // resolved model, cwd, sandbox policy, and instruction sources.
 func (t *Thread) Info() *protocol.ThreadStartResponse { return t.started }
 
-// StartThread creates a thread and returns a handle to it.
+// StartThread creates the client's main thread and returns a handle to it.
+//
+// One client drives one main thread. The server may still create additional
+// threads on its own for sub-agents, reviews, and compaction, and their
+// notifications arrive through the same Handler carrying their own threadId; the
+// invariant is about what the CALLER drives, not what exists on the server.
+//
+// Calling this twice returns ErrMainThreadExists. Run a second client for a
+// second conversation, which also gives each one its own process and handler.
 func (c *Client) StartThread(ctx context.Context, params protocol.ThreadStartParams) (*Thread, error) {
+	if err := c.claimMainThread(); err != nil {
+		return nil, err
+	}
 	out, err := c.ThreadStart(ctx, params)
 	if err != nil {
+		c.releaseMainThread()
 		return nil, err
 	}
 	if out.Thread == nil || out.Thread.ID == "" {
+		c.releaseMainThread()
 		return nil, errors.New("codex: thread/start returned no thread id")
 	}
-	return &Thread{client: c, id: out.Thread.ID, started: out}, nil
+	t := &Thread{client: c, id: out.Thread.ID, started: out}
+	c.setMainThread(t)
+	return t, nil
 }
 
-// ResumeThread reopens a stored thread and returns a handle to it.
+// ResumeThread reopens a stored thread as this client's main thread.
+//
+// Like StartThread, this returns ErrMainThreadExists if the client already has
+// one.
 func (c *Client) ResumeThread(ctx context.Context, params protocol.ThreadResumeParams) (*Thread, error) {
+	if err := c.claimMainThread(); err != nil {
+		return nil, err
+	}
 	out, err := c.ThreadResume(ctx, params)
 	if err != nil {
+		c.releaseMainThread()
 		return nil, err
 	}
 	if out.Thread == nil || out.Thread.ID == "" {
+		c.releaseMainThread()
 		return nil, errors.New("codex: thread/resume returned no thread id")
 	}
 	// ThreadResumeResponse and ThreadStartResponse describe the same thing, so
 	// the handle carries the start-shaped view for a uniform Info().
-	return &Thread{
-		client:  c,
-		id:      out.Thread.ID,
-		started: resumeToStart(out),
-	}, nil
+	t := &Thread{client: c, id: out.Thread.ID, started: resumeToStart(out)}
+	c.setMainThread(t)
+	return t, nil
 }
 
 // Thread returns a handle for a thread id that is already loaded, without
 // starting or resuming anything.
 //
-// Use it when the id came from elsewhere, such as thread/list. Info returns nil
-// for such a handle.
+// Use it to address a thread whose id came from elsewhere: thread/list, or a
+// sub-agent id observed in a notification. This does NOT claim the main thread
+// slot, because the caller did not create the thread and does not own its
+// lifecycle. Info returns nil for such a handle.
 func (c *Client) Thread(id string) *Thread {
 	return &Thread{client: c, id: id}
 }
@@ -148,22 +178,170 @@ func (e *TurnFailedError) Error() string {
 	return b.String()
 }
 
-// Run starts a turn with the given input and blocks until it completes.
+// Run starts a turn and blocks until it completes.
+//
+// Incremental output arrives through the client's Handler callbacks while Run is
+// blocked. A caller that wants to print text as it streams registers
+// OnAgentMessageDelta with WithHandler and reads the final result here; there is
+// deliberately no second event-channel API, because two delivery mechanisms for
+// the same notifications means two things to keep in sync.
 //
 // A turn that fails returns a *TurnFailedError. A turn that is interrupted does
-// NOT return an error: check TurnResult.Interrupted.
+// NOT return an error, since interruption is usually the caller's own doing:
+// check TurnResult.Interrupted.
 //
-// If ctx is cancelled, Run asks the server to interrupt the turn and then
-// returns ctx.Err(), so a cancelled context does not leave the agent working.
+// If ctx is cancelled, Run asks the server to interrupt the turn and then returns
+// ctx.Err(), so a cancelled context does not leave the agent working.
+//
+// One ordering caveat: Run may return before OnTurnCompleted has finished. The
+// internal completion signal fires ahead of user callbacks so that a panicking
+// callback cannot strand a Run call, which means the two are concurrent at the
+// very end of a turn. Everything OnTurnCompleted receives is also in the returned
+// TurnResult, so read the result rather than relying on the callback having run.
 func (t *Thread) Run(ctx context.Context, params protocol.TurnStartParams) (*TurnResult, error) {
-	stream, err := t.RunStream(ctx, params)
+	params.ThreadID = t.id
+
+	// Register the waiter BEFORE starting the turn. On a fast turn the server can
+	// emit turn/completed before the turn/start response is processed, and
+	// registering afterwards would miss it and block forever.
+	waiter := newTurnWaiter()
+	t.client.dispatch.addWaiter(t.id, waiter)
+	defer t.client.dispatch.removeWaiter(t.id, waiter)
+
+	out, err := t.client.TurnStart(ctx, params)
 	if err != nil {
 		return nil, err
 	}
-	// Draining is required: the events channel is what advances the stream.
-	for range stream.Events() {
+	if out.Turn == nil || out.Turn.ID == "" {
+		return nil, errors.New("codex: turn/start returned no turn id")
 	}
-	return stream.Result()
+	waiter.setTurnID(out.Turn.ID)
+	t.setCurrentTurn(out.Turn.ID)
+	defer t.setCurrentTurn("")
+
+	select {
+	case <-ctx.Done():
+		// The caller gave up, so ask the server to stop rather than leaving it
+		// working on a result nobody will read.
+		t.interruptDetached(out.Turn.ID)
+		return nil, ctx.Err()
+
+	case turn := <-waiter.done:
+		if turn == nil {
+			return nil, errors.New("codex: connection closed before the turn completed")
+		}
+		return newTurnResult(turn, waiter.collectedItems(), waiter.err())
+	}
+}
+
+func (t *Thread) setCurrentTurn(id string) {
+	t.turnMu.Lock()
+	t.currentTurn = id
+	t.turnMu.Unlock()
+}
+
+// CurrentTurnID returns the id of the turn Run is blocked on, or "" when no turn
+// is in flight.
+//
+// Run blocks, so steering means calling from another goroutine, and this saves
+// capturing the id out of an OnTurnStarted callback just to name the turn you
+// want to steer.
+func (t *Thread) CurrentTurnID() string {
+	t.turnMu.Lock()
+	defer t.turnMu.Unlock()
+	return t.currentTurn
+}
+
+// SteerCurrent appends input to whichever turn is in flight.
+//
+// It fails if no turn is running. Prefer it over Steer when you simply want to
+// add to "the turn happening now", which is the usual case: the server rejects a
+// steer whose expected turn id does not match the active one, so passing the id
+// yourself only helps when you specifically need that check.
+func (t *Thread) SteerCurrent(ctx context.Context, input ...*protocol.UserInput) (string, error) {
+	turnID := t.CurrentTurnID()
+	if turnID == "" {
+		return "", errors.New("codex: no turn is in flight to steer")
+	}
+	return t.Steer(ctx, turnID, input...)
+}
+
+// SteerText is SteerCurrent for a single text message.
+func (t *Thread) SteerText(ctx context.Context, text string) (string, error) {
+	return t.SteerCurrent(ctx, TextInput(text))
+}
+
+// interruptTimeout bounds the courtesy interrupt sent when a caller's context is
+// cancelled. It is short: the caller has already stopped waiting.
+const interruptTimeout = 5 * time.Second
+
+// interruptDetached cancels a turn on a fresh context, because the caller's
+// context is already cancelled and would reject the call.
+func (t *Thread) interruptDetached(turnID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), interruptTimeout)
+	defer cancel()
+	_ = t.Interrupt(ctx, turnID)
+}
+
+// newTurnResult assembles the outcome, mapping a failed turn to a typed error and
+// leaving an interrupted turn error-free.
+func newTurnResult(
+	turn *protocol.Turn,
+	streamed []*protocol.ThreadItem,
+	lastErr *protocol.ErrorNotification,
+) (*TurnResult, error) {
+	// Prefer the items observed via item/completed: the app-server documentation
+	// names item/* as the source of truth, and the turn payload can arrive with an
+	// empty items array. Fall back to the payload for a server that populates it.
+	items := streamed
+	if len(items) == 0 {
+		items = turn.Items
+	}
+
+	result := &TurnResult{
+		Turn:         turn,
+		Items:        items,
+		AgentMessage: finalAgentMessage(items),
+	}
+	if turn.Status != protocol.TurnStatusFailed {
+		return result, nil
+	}
+
+	failure := &TurnFailedError{TurnID: turn.ID, Turn: turn}
+	if turn.Error != nil {
+		failure.Message = turn.Error.Message
+		failure.Info = turn.Error.CodexErrorInfo
+		if turn.Error.AdditionalDetails != nil {
+			failure.Details = *turn.Error.AdditionalDetails
+		}
+	}
+	// The error notification often carries detail the turn payload omits.
+	if lastErr != nil && lastErr.Error != nil {
+		if failure.Message == "" {
+			failure.Message = lastErr.Error.Message
+		}
+		if failure.Info == nil {
+			failure.Info = lastErr.Error.CodexErrorInfo
+		}
+	}
+	return result, failure
+}
+
+// finalAgentMessage concatenates the final-answer agent messages, which is the
+// reply a caller usually wants. Commentary-phase messages are excluded.
+func finalAgentMessage(items []*protocol.ThreadItem) string {
+	var b strings.Builder
+	for _, item := range items {
+		msg, ok := item.AsAgentMessage()
+		if !ok {
+			continue
+		}
+		// A nil phase means the server did not classify it; treat that as the reply.
+		if msg.Phase == nil || msg.Phase.IsFinalAnswer() {
+			b.WriteString(msg.Text)
+		}
+	}
+	return b.String()
 }
 
 // RunText is Run for the common case of a single text message.
@@ -268,78 +446,4 @@ func resumeToStart(in *protocol.ThreadResumeResponse) *protocol.ThreadStartRespo
 		return nil
 	}
 	return &out
-}
-
-// observer receives one thread's notifications alongside the client-level
-// handler. It is how Run and RunStream await turn completion without competing
-// with user callbacks.
-type observer struct {
-	mu     sync.Mutex
-	events chan *notification
-	closed bool
-}
-
-// observerReserve is spare capacity beyond the nominal buffer, held for terminal
-// notifications so they are never dropped.
-const observerReserve = 8
-
-func newObserver(buf int) *observer {
-	return &observer{events: make(chan *notification, buf+observerReserve)}
-}
-
-// notify enqueues a notification for the observer.
-//
-// It runs on the thread's dispatch goroutine and must not block indefinitely, so
-// a full queue drops the notification for the OBSERVER only; the client-level
-// handler still receives it. Dropping a delta degrades the stream but does not
-// break it.
-//
-// Terminal notifications are the exception and are NEVER dropped: losing
-// turn/completed would leave Run and RunStream waiting forever. The queue has a
-// small reserve beyond its nominal capacity for exactly this.
-func (o *observer) notify(n *notification) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.closed {
-		return
-	}
-	if isTerminalNotification(n.method) {
-		// Blocking here is unacceptable, so rely on the reserve headroom. If even
-		// that is exhausted the consumer is wedged, and the context or Close will
-		// unblock it instead.
-		select {
-		case o.events <- n:
-		default:
-			go func() {
-				o.mu.Lock()
-				defer o.mu.Unlock()
-				if !o.closed {
-					select {
-					case o.events <- n:
-					default:
-					}
-				}
-			}()
-		}
-		return
-	}
-	select {
-	case o.events <- n:
-	default:
-	}
-}
-
-// isTerminalNotification reports whether losing this notification would strand a
-// caller waiting for a turn to finish.
-func isTerminalNotification(method string) bool {
-	return method == protocol.NotifyTurnCompleted || method == protocol.NotifyError
-}
-
-func (o *observer) close() {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if !o.closed {
-		o.closed = true
-		close(o.events)
-	}
 }

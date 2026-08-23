@@ -30,9 +30,14 @@ type dispatcher struct {
 	queues map[string]*threadQueue
 	closed bool
 
-	// observers receive notifications for one thread in addition to the
-	// client-level handler. Thread.Run and RunStream register these.
-	observers map[string][]*observer
+	// waiters are the internal turn-completion signals Thread.Run blocks on,
+	// keyed by thread id.
+	//
+	// They are NOT a second delivery path for users: notifications reach callers
+	// through Handler callbacks only. Run needs a synchronous signal, and building
+	// that on the callback path would mean competing with the user's own
+	// OnTurnCompleted.
+	waiters map[string][]*turnWaiter
 
 	wg sync.WaitGroup
 }
@@ -51,11 +56,11 @@ type notification struct {
 
 func newDispatcher(h *Handler, logger *slog.Logger, buf int) *dispatcher {
 	return &dispatcher{
-		handler:   h,
-		logger:    logger,
-		bufSize:   buf,
-		queues:    make(map[string]*threadQueue),
-		observers: make(map[string][]*observer),
+		handler: h,
+		logger:  logger,
+		bufSize: buf,
+		queues:  make(map[string]*threadQueue),
+		waiters: make(map[string][]*turnWaiter),
 	}
 }
 
@@ -145,27 +150,20 @@ func (d *dispatcher) drain(q *threadQueue) {
 	}
 }
 
-// deliver invokes the observers and then the client-level handler. A panic in a
-// user callback is recovered and logged: it must not take down the connection or
-// silently stop delivery for that thread.
+// deliver dispatches one notification to the handler.
+//
+// Turn-completion waiters are signalled first, so a panicking user callback
+// cannot strand a Thread.Run call. A panic is recovered and logged: it must not
+// take down the connection or silently stop delivery for the rest of the thread.
 func (d *dispatcher) deliver(n *notification) {
+	d.signalWaiters(threadKeyOf(n.params), n)
+
 	defer func() {
 		if r := recover(); r != nil {
 			d.logger.Error("codex: notification handler panicked",
 				"method", n.method, "panic", r)
 		}
 	}()
-
-	// Thread-scoped observers run first, then the client-level handler always
-	// runs. Delivery is additive: an observer never suppresses the handler.
-	key := threadKeyOf(n.params)
-	d.mu.Lock()
-	obs := append([]*observer(nil), d.observers[key]...)
-	d.mu.Unlock()
-	for _, o := range obs {
-		o.notify(n)
-	}
-
 	d.invoke(n)
 }
 
@@ -445,26 +443,197 @@ func declined(reason string) *jsonrpc.Error {
 	return &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: reason}
 }
 
-// addObserver registers a per-thread observer, used by Thread.Run and RunStream
-// to await turn completion without competing with the client-level handler.
-func (d *dispatcher) addObserver(threadID string, o *observer) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.observers[threadID] = append(d.observers[threadID], o)
+// turnWaiter is how Thread.Run learns that its turn finished.
+//
+// It exists because Run needs a synchronous signal and the callback path belongs
+// to the user: hooking OnTurnCompleted internally would either overwrite the
+// caller's callback or require the SDK to chain onto it invisibly.
+type turnWaiter struct {
+	// done carries the terminal turn exactly once, then closes. A nil value means
+	// the connection ended before the turn completed.
+	done chan *protocol.Turn
+
+	mu     sync.Mutex
+	turnID string
+	// lastErr keeps the most recent error notification for the turn, which often
+	// carries a classification the turn payload itself omits.
+	lastErr *protocol.ErrorNotification
+	fired   bool
+	// pending holds a completion that arrived before turn/start responded, so a
+	// turn that finishes very fast is not missed.
+	pending *protocol.Turn
+
+	// items accumulates completed items in arrival order.
+	//
+	// This is necessary, not redundant: the app-server documentation states that
+	// item/* notifications are the source of truth for turn items, and the turn
+	// payload can arrive with an empty items array. Reading items only off the
+	// final turn would silently return an empty result.
+	items []*protocol.ThreadItem
+
+	// pendingItems buffers items seen before the turn id is known, for the same
+	// race the pending field covers.
+	pendingItems []*protocol.ThreadItem
 }
 
-func (d *dispatcher) removeObserver(threadID string, target *observer) {
+func newTurnWaiter() *turnWaiter {
+	return &turnWaiter{done: make(chan *protocol.Turn, 1)}
+}
+
+// setTurnID names the turn being awaited, once turn/start has responded. Anything
+// buffered while the id was unknown is applied here.
+func (w *turnWaiter) setTurnID(id string) {
+	w.mu.Lock()
+	w.turnID = id
+	buffered := w.pending
+	w.pending = nil
+	w.items = append(w.items, w.pendingItems...)
+	w.pendingItems = nil
+	w.mu.Unlock()
+
+	if buffered != nil && buffered.ID == id {
+		w.finish(buffered)
+	}
+}
+
+// addItem records a completed item for the turn.
+func (w *turnWaiter) addItem(turnID string, item *protocol.ThreadItem) {
+	if item == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	switch {
+	case w.turnID == "":
+		// The turn id is not known yet, so this may or may not belong to us. Keep
+		// it and reconcile in setTurnID.
+		w.pendingItems = append(w.pendingItems, item)
+	case w.turnID == turnID:
+		w.items = append(w.items, item)
+	}
+}
+
+// collectedItems returns the items seen for this turn, in arrival order.
+func (w *turnWaiter) collectedItems() []*protocol.ThreadItem {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]*protocol.ThreadItem(nil), w.items...)
+}
+
+// matches reports whether id is the turn being awaited. An empty turnID means
+// turn/start has not responded yet, so nothing can be matched with confidence.
+func (w *turnWaiter) matches(id string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.turnID != "" && w.turnID == id
+}
+
+// buffer stores a completion that raced ahead of the turn/start response.
+func (w *turnWaiter) buffer(turn *protocol.Turn) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.turnID == "" && !w.fired {
+		w.pending = turn
+	}
+}
+
+func (w *turnWaiter) finish(turn *protocol.Turn) {
+	w.mu.Lock()
+	if w.fired {
+		w.mu.Unlock()
+		return
+	}
+	w.fired = true
+	w.mu.Unlock()
+
+	w.done <- turn
+	close(w.done)
+}
+
+func (w *turnWaiter) recordError(n *protocol.ErrorNotification) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lastErr = n
+}
+
+func (w *turnWaiter) err() *protocol.ErrorNotification {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.lastErr
+}
+
+func (d *dispatcher) addWaiter(threadID string, w *turnWaiter) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	list := d.observers[threadID]
-	for i, o := range list {
-		if o == target {
-			d.observers[threadID] = append(list[:i], list[i+1:]...)
+	d.waiters[threadID] = append(d.waiters[threadID], w)
+}
+
+func (d *dispatcher) removeWaiter(threadID string, target *turnWaiter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	list := d.waiters[threadID]
+	for i, w := range list {
+		if w == target {
+			d.waiters[threadID] = append(list[:i], list[i+1:]...)
 			break
 		}
 	}
-	if len(d.observers[threadID]) == 0 {
-		delete(d.observers, threadID)
+	if len(d.waiters[threadID]) == 0 {
+		delete(d.waiters, threadID)
+	}
+}
+
+// signalWaiters feeds turn lifecycle notifications to any Run call waiting on
+// this thread.
+func (d *dispatcher) signalWaiters(threadID string, n *notification) {
+	switch n.method {
+	case protocol.NotifyTurnCompleted, protocol.NotifyError, protocol.NotifyItemCompleted:
+	default:
+		return
+	}
+	d.mu.Lock()
+	waiting := append([]*turnWaiter(nil), d.waiters[threadID]...)
+	d.mu.Unlock()
+	if len(waiting) == 0 {
+		return
+	}
+
+	switch n.method {
+	case protocol.NotifyItemCompleted:
+		// item/* is the documented source of truth for turn items; the turn
+		// payload may carry an empty items array.
+		var p protocol.ItemCompletedNotification
+		if err := json.Unmarshal(n.params, &p); err != nil {
+			return
+		}
+		for _, w := range waiting {
+			w.addItem(p.TurnID, p.Item)
+		}
+
+	case protocol.NotifyError:
+		var p protocol.ErrorNotification
+		if err := json.Unmarshal(n.params, &p); err != nil {
+			return
+		}
+		for _, w := range waiting {
+			if w.matches(p.TurnID) {
+				w.recordError(&p)
+			}
+		}
+	case protocol.NotifyTurnCompleted:
+		var p protocol.TurnCompletedNotification
+		if err := json.Unmarshal(n.params, &p); err != nil || p.Turn == nil {
+			return
+		}
+		for _, w := range waiting {
+			if w.matches(p.Turn.ID) {
+				w.finish(p.Turn)
+				continue
+			}
+			// The completion may have raced ahead of the turn/start response, so
+			// hold it rather than dropping it.
+			w.buffer(p.Turn)
+		}
 	}
 }
 
@@ -481,8 +650,8 @@ func (d *dispatcher) shutdown() {
 	for _, q := range d.queues {
 		queues = append(queues, q)
 	}
-	observers := d.observers
-	d.observers = make(map[string][]*observer)
+	waiting := d.waiters
+	d.waiters = make(map[string][]*turnWaiter)
 	d.mu.Unlock()
 
 	for _, q := range queues {
@@ -490,10 +659,10 @@ func (d *dispatcher) shutdown() {
 	}
 	d.wg.Wait()
 
-	// Unblock anything waiting on a turn that will now never complete.
-	for _, list := range observers {
-		for _, o := range list {
-			o.close()
+	// Unblock any Run call waiting on a turn that will now never complete.
+	for _, list := range waiting {
+		for _, w := range list {
+			w.finish(nil)
 		}
 	}
 }

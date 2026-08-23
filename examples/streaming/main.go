@@ -1,5 +1,5 @@
-// Command streaming demonstrates the streaming layer: print the agent's reply as
-// it arrives, show tool activity, and handle approvals interactively.
+// Command streaming shows the callback style: register handlers once, then run a
+// turn and let the callbacks render output as it arrives.
 //
 //	go run ./examples/streaming -prompt "list the files here and summarize"
 //
@@ -21,7 +21,7 @@ import (
 )
 
 func main() {
-	prompt := flag.String("prompt", "List the files in this directory. 你写一下 1.md 内容是 123", "the message to send")
+	prompt := flag.String("prompt", "List the files in this directory.", "the message to send")
 	write := flag.Bool("write", false, "allow the agent to modify files (asks before each change)")
 	timeout := flag.Duration("timeout", 10*time.Minute, "overall timeout")
 	flag.Parse()
@@ -38,10 +38,13 @@ func run(prompt string, write bool, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	// The handler covers the events worth showing a user. Note the approval
-	// callbacks: without them the SDK would decline every request, so an agent
-	// that needs to write would silently get nowhere.
+	// Callbacks are the single delivery path for everything the server streams.
+	// They fire on the thread's own goroutine in arrival order, so appending
+	// deltas as they come reassembles the reply correctly.
 	handler := codex.Handler{
+		OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
+			fmt.Print(n.Delta)
+		},
 		OnItemStarted: func(n *protocol.ItemStartedNotification) {
 			if cmd, ok := n.Item.AsCommandExecution(); ok {
 				fmt.Fprintf(os.Stderr, "\n  $ %s\n", cmd.Command)
@@ -52,23 +55,35 @@ func run(prompt string, write bool, timeout time.Duration) error {
 				}
 			}
 		},
+		OnCommandOutputDelta: func(n *protocol.CommandExecutionOutputDeltaNotification) {
+			fmt.Fprint(os.Stderr, indent(n.Delta))
+		},
 		OnTurnPlan: func(n *protocol.TurnPlanUpdatedNotification) {
 			fmt.Fprintln(os.Stderr, "\n  plan:")
 			for _, step := range n.Plan {
 				fmt.Fprintf(os.Stderr, "    [%s] %s\n", step.Status, step.Step)
 			}
 		},
+		OnError: func(n *protocol.ErrorNotification) {
+			if n.Error != nil {
+				fmt.Fprintf(os.Stderr, "\n  error: %s\n", n.Error.Message)
+			}
+		},
 		OnWarning: func(n *protocol.WarningNotification) {
 			fmt.Fprintf(os.Stderr, "\n  warning: %s\n", n.Message)
 		},
+
+		// Approvals are requests, not notifications: the turn is blocked until
+		// these return. Without them the SDK declines everything, so an agent
+		// asked to write would get nowhere.
 		OnCommandApproval: func(p *protocol.CommandExecutionRequestApprovalParams) (protocol.CommandExecutionApprovalDecision, error) {
-			reason := ""
-			if p.Reason != nil {
-				reason = " (" + *p.Reason + ")"
-			}
 			command := "the requested command"
 			if p.Command != nil {
 				command = *p.Command
+			}
+			reason := ""
+			if p.Reason != nil {
+				reason = " (" + *p.Reason + ")"
 			}
 			if confirm(fmt.Sprintf("run %q%s?", command, reason)) {
 				return protocol.NewCommandExecutionApprovalDecisionAccept(), nil
@@ -93,53 +108,30 @@ func run(prompt string, write bool, timeout time.Duration) error {
 	defer client.Close()
 
 	cwd, _ := os.Getwd()
-	params := protocol.ThreadStartParams{Cwd: &cwd}
+	sandbox := protocol.SandboxModeReadOnly
 	if write {
-		mode := protocol.SandboxModeWorkspaceWrite
-		params.Sandbox = &mode
-	} else {
-		mode := protocol.SandboxModeReadOnly
-		params.Sandbox = &mode
+		sandbox = protocol.SandboxModeWorkspaceWrite
 	}
 
-	thread, err := client.StartThread(ctx, params)
+	thread, err := client.StartThread(ctx, protocol.NewThreadStartParams(
+		protocol.WithThreadStartParamsCwd(cwd),
+		protocol.WithThreadStartParamsSandbox(sandbox),
+	))
 	if err != nil {
 		return err
 	}
 
-	stream, err := thread.RunStream(ctx, protocol.TurnStartParams{
-		Input: []*protocol.UserInput{codex.TextInput(prompt)},
-	})
+	// Run blocks until the turn ends; the callbacks above do the rendering in the
+	// meantime.
+	result, err := thread.Run(ctx, protocol.NewTurnStartParams(
+		[]*protocol.UserInput{codex.TextInput(prompt)},
+		thread.ID(),
+	))
 	if err != nil {
 		return err
-	}
-
-	// Events arrive in order, so printing deltas as they come reassembles the
-	// reply correctly.
-	for ev := range stream.Events() {
-		switch ev.Kind {
-		case codex.EventItemStarted:
-			fmt.Print(ev.Item.AsMCPToolCall())
-		case codex.EventReasoningDelta:
-			fmt.Print(ev.Delta)
-		case codex.EventAgentMessageDelta:
-			fmt.Print(ev.Delta)
-		case codex.EventCommandOutputDelta:
-			fmt.Fprint(os.Stderr, indent(ev.Delta))
-		case codex.EventError:
-			if ev.Err != nil && ev.Err.Error != nil {
-				fmt.Fprintf(os.Stderr, "\n  error: %s\n", ev.Err.Error.Message)
-			}
-		}
 	}
 	fmt.Println()
-
-	result, err := stream.Result()
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "\nturn %s: %s, %d items\n",
-		stream.TurnID(), result.Status(), len(result.Items))
+	fmt.Fprintf(os.Stderr, "\nturn %s: %d items\n", result.Status(), len(result.Items))
 	return nil
 }
 

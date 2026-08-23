@@ -3,24 +3,21 @@
 A Go client for the [Codex app-server](https://learn.chatgpt.com/docs/app-server) JSON-RPC protocol. It spawns `codex app-server` as a child process and gives you threads, turns, streamed items, and approvals as ordinary Go types.
 
 ```go
-client, err := codex.New(ctx,
+session, err := codex.Open(ctx,
     codex.WithClientInfo("my_product", "My Product", "1.0.0"))
 if err != nil {
     return err
 }
-defer client.Close()
+defer session.Close()
 
-thread, err := client.StartThread(ctx, protocol.ThreadStartParams{})
-if err != nil {
-    return err
-}
-
-result, err := thread.RunText(ctx, "Summarize this repo.")
+result, err := session.RunText(ctx, "Summarize this repo.")
 if err != nil {
     return err
 }
 fmt.Println(result.AgentMessage)
 ```
+
+`Open` spawns the server, completes the handshake, and starts one thread in a single call.
 
 ## Requirements
 
@@ -49,27 +46,25 @@ err := client.Call(ctx, "plugin/list", protocol.PluginListParams{}, &out)
 
 ## Streaming
 
-```go
-stream, err := thread.RunStream(ctx, protocol.TurnStartParams{
-    Input: []*protocol.UserInput{codex.TextInput("List the files here.")},
-})
-if err != nil {
-    return err
-}
+There is one delivery mechanism: callbacks. `Run` blocks while they fire, so printing as output arrives and reading the final result are the same flow.
 
-for ev := range stream.Events() {
-    switch ev.Kind {
-    case codex.EventAgentMessageDelta:
-        fmt.Print(ev.Delta)
-    case codex.EventItemStarted:
-        if cmd, ok := ev.Item.AsCommandExecution(); ok {
+```go
+client, err := codex.New(ctx, codex.WithHandler(codex.Handler{
+    OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
+        fmt.Print(n.Delta)
+    },
+    OnItemStarted: func(n *protocol.ItemStartedNotification) {
+        if cmd, ok := n.Item.AsCommandExecution(); ok {
             fmt.Fprintf(os.Stderr, "$ %s\n", cmd.Command)
         }
-    }
-}
+    },
+}))
 
-result, err := stream.Result()
+thread, err := client.StartThread(ctx, protocol.ThreadStartParams{})
+result, err := thread.RunText(ctx, "List the files here.")  // callbacks fire while this blocks
 ```
+
+There is deliberately no event-channel API. Two mechanisms delivering the same notifications means two sets of ordering and backpressure rules to keep in agreement, and the callback path already covers the streaming case.
 
 ## Notifications
 
@@ -77,9 +72,6 @@ Register callbacks with `WithHandler`. Every field is optional; unset means igno
 
 ```go
 codex.WithHandler(codex.Handler{
-    OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
-        fmt.Print(n.Delta)
-    },
     OnTurnCompleted: func(n *protocol.TurnCompletedNotification) {
         log.Printf("turn %s: %s", n.Turn.ID, n.Turn.Status)
     },
@@ -92,6 +84,63 @@ codex.WithHandler(codex.Handler{
 ```
 
 Callbacks for one thread run on that thread's own goroutine **in arrival order**, so deltas concatenate correctly. Different threads progress independently, so a slow callback on one thread doesn't delay another. Callbacks must not block indefinitely — the per-thread queue is bounded, and a stalled callback eventually applies backpressure to the connection. (Notifications are never *dropped* on overflow; losing a delta would corrupt the message you're reassembling.)
+
+**Handlers are client-level, not per-thread.** That's not an oversight: the server creates threads you never asked for — sub-agents, reviews, compaction — and their ids are never returned by `StartThread`. A per-thread handler map would silently drop all of it. Every notification carries its `threadId`, so compare against `client.MainThread().ID()` to tell your own work from a sub-agent's.
+
+## Sessions and threads
+
+`codex.Open` merges the client and its thread into one object, which is what most programs want:
+
+```go
+session, err := codex.Open(ctx,
+    codex.WithClientInfo("my_product", "My Product", "1.0.0"),
+    codex.WithHandler(handler),
+    codex.WithThreadOptions(
+        protocol.WithThreadStartParamsCwd("/repo"),
+        protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+    ),
+)
+defer session.Close()
+
+result, err := session.RunText(ctx, "Run the tests.")
+```
+
+Client options pass in directly; thread configuration goes through `WithThreadOptions`. If starting the thread fails, `Open` closes the client, so a failed open leaks no child process.
+
+Under it, **a client drives exactly one caller-owned thread.** With `Open` that's structural — there's no second `StartThread` to call. Using `Client` directly, a second `StartThread` or `ResumeThread` returns `ErrMainThreadExists`; run another client for another conversation.
+
+```go
+client, err := codex.New(ctx)                       // when you need resume, fork,
+thread, err := client.StartThread(ctx, params)      // or to inspect the server first
+same := client.MainThread()
+```
+
+Addressing a thread you didn't create stays available and doesn't claim the slot — necessary, because sub-agent and review threads are created by the server:
+
+```go
+sub := client.Thread(someSubAgentThreadID)
+```
+
+## Steering
+
+Steering appends input to a turn that is **already running**, so the agent adjusts what it is currently doing rather than starting over. `Run` blocks for the whole turn, so a steer comes from another goroutine:
+
+```go
+go func() {
+    // Wait until a turn is actually in flight; steering before that fails,
+    // because the server matches the steer against the active turn id.
+    for session.CurrentTurnID() == "" {
+        time.Sleep(10 * time.Millisecond)
+    }
+    _, err := session.SteerText(ctx, "also check the tests")
+}()
+
+result, err := session.RunText(ctx, longMultiStepTask)
+```
+
+`CurrentTurnID` saves capturing the id out of an `OnTurnStarted` callback. Use `Steer(ctx, turnID, ...)` when you specifically want the server to verify you are steering the turn you think you are.
+
+Steering only makes sense while the agent still has work left, so `go run ./examples/steer` uses a deliberately multi-step prompt. A one-shot question finishes before the steer arrives and the server rejects it.
 
 ## Approvals
 

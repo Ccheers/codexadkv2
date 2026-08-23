@@ -9,12 +9,32 @@ import "github.com/ccheers/codexadkv2/codex/protocol"
 // notifications can be added without breaking implementors, and so that godoc
 // lists every available event in one place.
 //
+// # Why callbacks are the only delivery mechanism
+//
+// Callbacks are client-level rather than registered per thread, and they are the
+// single path for everything the server streams. Both choices are deliberate.
+//
+// Client-level, because the server creates threads the caller never asked for:
+// sub-agents, reviews, and compaction all run on their own thread ids, which are
+// never returned by StartThread. A handler registered per thread would silently
+// drop all of that traffic. Every notification carries its threadId, so a callback
+// can tell whose work it is: compare against Client.MainThread().
+//
+// Single path, because an event-channel API alongside callbacks would mean two
+// mechanisms delivering the same notifications, with two sets of ordering and
+// backpressure rules to keep in agreement. Thread.Run blocks while callbacks
+// stream, which covers the print-as-you-go case without a second API.
+//
 // # Ordering and concurrency
 //
 // Callbacks for a given thread are invoked on that thread's own goroutine, in
 // the order the server sent them. Deltas therefore always arrive in order.
 // Different threads progress independently, so a slow callback for one thread
 // does not delay another.
+//
+// Thread.Run may return just before OnTurnCompleted finishes, since the internal
+// completion signal deliberately fires ahead of user callbacks. Read Run's
+// TurnResult rather than depending on the callback having completed.
 //
 // Callbacks must not block indefinitely. Each thread's queue is bounded, and
 // once it fills the connection stops reading, which delays responses to

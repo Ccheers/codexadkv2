@@ -1,5 +1,5 @@
-// Command basic demonstrates the ergonomic layer: start a thread, run a turn,
-// print the reply.
+// Command basic is the shortest useful program: open a session, run a turn, print
+// the reply.
 //
 //	go run ./examples/basic -prompt "summarize this repo"
 //
@@ -35,14 +35,33 @@ func main() {
 
 func run(prompt, cwd, model string, timeout time.Duration, verbose bool) error {
 	// Ctrl-C cancels the context, which interrupts the turn rather than leaving
-	// the agent working.
+	// the agent working on a result nobody will read.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	opts := []codex.Option{
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+
+	// Read-only with approvals disabled is the right default for an unattended
+	// run: the agent cannot modify anything, and nothing blocks waiting for a
+	// decision that no one is there to make.
+	threadOpts := []protocol.ThreadStartParamsOption{
+		protocol.WithThreadStartParamsCwd(cwd),
+		protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+		protocol.WithThreadStartParamsApprovalPolicy(protocol.NewAskForApprovalNever()),
+	}
+	if model != "" {
+		threadOpts = append(threadOpts, protocol.WithThreadStartParamsModel(model))
+	}
+
+	opts := []codex.SessionOption{
 		codex.WithClientInfo("codex-go-example", "Codex Go SDK Example", "0.1.0"),
+		codex.WithThreadOptions(threadOpts...),
 	}
 	if verbose {
 		opts = append(opts,
@@ -53,45 +72,21 @@ func run(prompt, cwd, model string, timeout time.Duration, verbose bool) error {
 		)
 	}
 
-	client, err := codex.New(ctx, opts...)
+	// One call spawns the server, completes the handshake, and starts the thread.
+	session, err := codex.Open(ctx, opts...)
 	if err != nil {
 		return err
 	}
-	defer client.Close()
+	defer session.Close()
 
 	if verbose {
-		info := client.ServerInfo()
+		info := session.ServerInfo()
 		fmt.Fprintf(os.Stderr, "connected to %s (%s/%s)\n",
 			info.UserAgent, info.PlatformFamily, info.PlatformOS)
 	}
+	fmt.Fprintf(os.Stderr, "thread %s\n", session.ID())
 
-	if cwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cwd = wd
-		}
-	}
-
-	// Read-only with approvals disabled is the right default for an unattended
-	// example: the agent cannot modify anything, and nothing can block waiting
-	// for a decision.
-	sandbox := protocol.SandboxModeReadOnly
-	never := protocol.NewAskForApprovalNever()
-	params := protocol.ThreadStartParams{
-		Cwd:            &cwd,
-		Sandbox:        &sandbox,
-		ApprovalPolicy: &never,
-	}
-	if model != "" {
-		params.Model = &model
-	}
-
-	thread, err := client.StartThread(ctx, params)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "thread %s\n", thread.ID())
-
-	result, err := thread.RunText(ctx, prompt)
+	result, err := session.RunText(ctx, prompt)
 	if err != nil {
 		return err
 	}

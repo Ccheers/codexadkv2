@@ -521,7 +521,10 @@ func TestRPCErrorIsTypedAndPreservesCode(t *testing.T) {
 	}
 }
 
-func TestRunStreamEmitsOrderedEvents(t *testing.T) {
+// TestCallbacksStreamDuringRun replaces the old event-channel test: streaming now
+// happens through callbacks while Run is blocked, and this checks the two stay in
+// agreement.
+func TestCallbacksStreamDuringRun(t *testing.T) {
 	srv := newFakeServer(t)
 	srv.reply("thread/start", map[string]any{
 		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
@@ -541,7 +544,12 @@ func TestRunStreamEmitsOrderedEvents(t *testing.T) {
 			}
 			srv.notify(protocol.NotifyTurnCompleted, map[string]any{
 				"threadId": "thr_1",
-				"turn":     map[string]any{"id": "turn_1", "status": "completed", "items": []any{}},
+				"turn": map[string]any{
+					"id": "turn_1", "status": "completed",
+					"items": []any{map[string]any{
+						"type": "agentMessage", "id": "i1", "text": "abc", "phase": "final_answer",
+					}},
+				},
 			})
 		}()
 		return map[string]any{
@@ -549,35 +557,148 @@ func TestRunStreamEmitsOrderedEvents(t *testing.T) {
 		}, nil
 	})
 
-	c := newTestClient(t, srv)
-	thread, _ := c.StartThread(context.Background(), protocol.ThreadStartParams{})
+	var (
+		mu       sync.Mutex
+		streamed strings.Builder
+		order    []string
+	)
+	c := newTestClient(t, srv, codex.WithHandler(codex.Handler{
+		OnTurnStarted: func(*protocol.TurnStartedNotification) {
+			mu.Lock()
+			order = append(order, "started")
+			mu.Unlock()
+		},
+		OnAgentMessageDelta: func(n *protocol.AgentMessageDeltaNotification) {
+			mu.Lock()
+			streamed.WriteString(n.Delta)
+			order = append(order, "delta")
+			mu.Unlock()
+		},
+		OnTurnCompleted: func(*protocol.TurnCompletedNotification) {
+			mu.Lock()
+			order = append(order, "completed")
+			mu.Unlock()
+		},
+	}))
 
-	stream, err := thread.RunStream(context.Background(), protocol.TurnStartParams{
-		Input: []*protocol.UserInput{codex.TextInput("go")},
+	thread, err := c.StartThread(context.Background(), protocol.ThreadStartParams{})
+	if err != nil {
+		t.Fatalf("StartThread: %v", err)
+	}
+	result, err := thread.RunText(context.Background(), "go")
+	if err != nil {
+		t.Fatalf("RunText: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if streamed.String() != "abc" {
+		t.Errorf("streamed text = %q, want abc: deltas arrived out of order or were dropped",
+			streamed.String())
+	}
+	// The final result must agree with what the callbacks saw.
+	if result.AgentMessage != "abc" {
+		t.Errorf("AgentMessage = %q, want abc", result.AgentMessage)
+	}
+	// turn/started must precede the deltas. OnTurnCompleted is deliberately NOT
+	// asserted to have run by now: waiters are signalled before user callbacks so
+	// that a panicking callback cannot strand Run, which means Run can return
+	// while OnTurnCompleted is still queued. Callers who need the completion
+	// callback to have finished should use its side effects, not Run's return.
+	if len(order) < 2 || order[0] != "started" {
+		t.Errorf("callback order = %v, want turn/started first", order)
+	}
+	for _, k := range order[1:4] {
+		if k != "delta" {
+			t.Errorf("callback order = %v, want three deltas after started", order)
+			break
+		}
+	}
+}
+
+// TestOneMainThreadPerClient pins the invariant: a client drives exactly one
+// caller-owned thread, so a second attempt is refused rather than silently
+// creating an ambiguous second conversation on the same handler.
+func TestOneMainThreadPerClient(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":  "m", "modelProvider": "openai", "cwd": "/r",
+		"approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"},
 	})
+
+	c := newTestClient(t, srv)
+	first, err := c.StartThread(context.Background(), protocol.ThreadStartParams{})
 	if err != nil {
-		t.Fatalf("RunStream: %v", err)
+		t.Fatalf("first StartThread: %v", err)
+	}
+	if got := c.MainThread(); got == nil || got.ID() != first.ID() {
+		t.Errorf("MainThread() = %v, want the thread just started", got)
 	}
 
-	var kinds []codex.EventKind
-	var text strings.Builder
-	for ev := range stream.Events() {
-		kinds = append(kinds, ev.Kind)
-		text.WriteString(ev.AgentText())
+	if _, err := c.StartThread(context.Background(), protocol.ThreadStartParams{}); !errors.Is(err, codex.ErrMainThreadExists) {
+		t.Errorf("second StartThread err = %v, want ErrMainThreadExists", err)
 	}
-	if text.String() != "abc" {
-		t.Errorf("streamed text = %q, want abc", text.String())
-	}
-	if len(kinds) == 0 || kinds[len(kinds)-1] != codex.EventTurnCompleted {
-		t.Errorf("event kinds = %v, want turn.completed last", kinds)
+	if _, err := c.ResumeThread(context.Background(), protocol.ThreadResumeParams{ThreadID: "thr_2"}); !errors.Is(err, codex.ErrMainThreadExists) {
+		t.Errorf("ResumeThread err = %v, want ErrMainThreadExists", err)
 	}
 
-	result, err := stream.Result()
-	if err != nil {
-		t.Fatalf("Result: %v", err)
+	// Addressing another thread by id stays allowed: sub-agent and review threads
+	// are created by the server, and the caller must be able to reach them.
+	if other := c.Thread("thr_subagent"); other == nil || other.ID() != "thr_subagent" {
+		t.Error("Thread(id) must still return a usable handle for a server-created thread")
 	}
-	if result.Status() != protocol.TurnStatusCompleted {
-		t.Errorf("status = %q, want completed", result.Status())
+}
+
+// TestFailedStartReleasesMainThreadSlot: a transient failure must not permanently
+// disable the client.
+func TestFailedStartReleasesMainThreadSlot(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.replyError("thread/start", jsonrpc.CodeInternalError, "transient failure")
+
+	c := newTestClient(t, srv)
+	if _, err := c.StartThread(context.Background(), protocol.ThreadStartParams{}); err == nil {
+		t.Fatal("StartThread succeeded, want the server error")
+	}
+
+	// The slot must be free again, so a retry can work.
+	srv.reply("thread/start", map[string]any{
+		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":  "m", "modelProvider": "openai", "cwd": "/r",
+		"approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"},
+	})
+	if _, err := c.StartThread(context.Background(), protocol.ThreadStartParams{}); err != nil {
+		t.Errorf("retry after a failed start: %v, want success", err)
+	}
+}
+
+// TestSubAgentNotificationsStillReachHandler is why handlers are client-level
+// rather than registered per thread: the server creates threads for sub-agents,
+// reviews, and compaction, and their ids are never returned to the caller. A
+// thread-keyed handler map would drop all of it.
+func TestSubAgentNotificationsStillReachHandler(t *testing.T) {
+	srv := newFakeServer(t)
+
+	seen := make(chan string, 4)
+	newTestClient(t, srv, codex.WithHandler(codex.Handler{
+		OnItemStarted: func(n *protocol.ItemStartedNotification) {
+			seen <- n.ThreadID
+		},
+	}))
+
+	// A thread id the caller never started and could not have registered for.
+	srv.notify(protocol.NotifyItemStarted, map[string]any{
+		"threadId": "thr_subagent_xyz", "turnId": "turn_9", "startedAtMs": 1,
+		"item": map[string]any{"type": "agentMessage", "id": "i1", "text": "sub"},
+	})
+
+	select {
+	case id := <-seen:
+		if id != "thr_subagent_xyz" {
+			t.Errorf("threadId = %q, want the sub-agent thread id", id)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a sub-agent thread's notification never reached the handler")
 	}
 }
 
@@ -682,4 +803,209 @@ func waitUntil(t *testing.T, cond func() bool, msg string) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatal(msg)
+}
+
+// TestOpenSessionStartsClientAndThread covers the merged entry point: one call
+// spawns the server and starts the thread, so the one-thread invariant is
+// structural rather than a runtime error the caller has to handle.
+func TestOpenSessionStartsClientAndThread(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":  "m", "modelProvider": "openai", "cwd": "/r",
+		"approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"},
+	})
+
+	// Client options pass straight in, with no wrapper, alongside thread options.
+	session, err := codex.Open(context.Background(),
+		codex.WithTransport(srv),
+		codex.WithClientInfo("test", "Test", "0.1.0"),
+		codex.WithThreadOptions(
+			protocol.WithThreadStartParamsCwd("/repo"),
+			protocol.WithThreadStartParamsSandbox(protocol.SandboxModeReadOnly),
+		),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	if session.ID() != "thr_1" {
+		t.Errorf("ID() = %q, want thr_1", session.ID())
+	}
+	if session.ServerInfo().UserAgent == "" {
+		t.Error("ServerInfo() is empty; the handshake did not complete")
+	}
+
+	// The thread options must have reached the wire.
+	var sent map[string]any
+	if err := json.Unmarshal(srv.paramsFor("thread/start"), &sent); err != nil {
+		t.Fatalf("decoding thread/start params: %v", err)
+	}
+	if sent["cwd"] != "/repo" {
+		t.Errorf("cwd = %v, want /repo", sent["cwd"])
+	}
+	if sent["sandbox"] != "read-only" {
+		t.Errorf("sandbox = %v, want read-only", sent["sandbox"])
+	}
+
+	// Session and Client agree on which thread is the main one.
+	if main := session.Client().MainThread(); main == nil || main.ID() != session.ID() {
+		t.Errorf("Client().MainThread() = %v, want the session's thread", main)
+	}
+}
+
+// TestOpenFailureClosesClient: a session that never opened must not leave a
+// spawned server behind.
+func TestOpenFailureClosesClient(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.replyError("thread/start", jsonrpc.CodeInternalError, "cannot start")
+
+	session, err := codex.Open(context.Background(), codex.WithTransport(srv))
+	if err == nil {
+		_ = session.Close()
+		t.Fatal("Open succeeded despite thread/start failing")
+	}
+	if session != nil {
+		t.Error("Open returned a non-nil session alongside an error")
+	}
+}
+
+// TestSessionRunDeliversResult checks the shortcut path end to end.
+func TestSessionRunDeliversResult(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":  "m", "modelProvider": "openai", "cwd": "/r",
+		"approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"},
+	})
+	srv.handle("turn/start", func(json.RawMessage, json.RawMessage) (any, map[string]any) {
+		go func() {
+			srv.notify(protocol.NotifyItemCompleted, map[string]any{
+				"threadId": "thr_1", "turnId": "turn_1", "completedAtMs": 1,
+				"item": map[string]any{
+					"type": "agentMessage", "id": "i1", "text": "42", "phase": "final_answer",
+				},
+			})
+			srv.notify(protocol.NotifyTurnCompleted, map[string]any{
+				"threadId": "thr_1",
+				"turn":     map[string]any{"id": "turn_1", "status": "completed", "items": []any{}},
+			})
+		}()
+		return map[string]any{
+			"turn": map[string]any{"id": "turn_1", "status": "inProgress", "items": []any{}},
+		}, nil
+	})
+
+	session, err := codex.Open(context.Background(), codex.WithTransport(srv))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	result, err := session.RunText(context.Background(), "what is the answer?")
+	if err != nil {
+		t.Fatalf("RunText: %v", err)
+	}
+	if result.AgentMessage != "42" {
+		t.Errorf("AgentMessage = %q, want 42", result.AgentMessage)
+	}
+	// The turn payload carried an empty items array, so this also proves items are
+	// taken from item/completed as the protocol documents.
+	if len(result.Items) != 1 {
+		t.Errorf("Items has %d entries, want 1 collected from item/completed", len(result.Items))
+	}
+}
+
+// TestSteerCurrentTurn covers steering a turn that Run is blocked on.
+//
+// Run blocks for the whole turn, so a steer necessarily comes from another
+// goroutine, and the caller needs the in-flight turn id. CurrentTurnID provides
+// it so callers do not have to capture it out of an OnTurnStarted callback.
+func TestSteerCurrentTurn(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread": map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":  "m", "modelProvider": "openai", "cwd": "/r",
+		"approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly"},
+	})
+
+	// The turn stays open until the steer arrives, which is what makes steering
+	// observable at all: a turn that finishes first would reject it.
+	steered := make(chan struct{})
+	srv.handle("turn/start", func(json.RawMessage, json.RawMessage) (any, map[string]any) {
+		go func() {
+			srv.notify(protocol.NotifyTurnStarted, map[string]any{
+				"threadId": "thr_1",
+				"turn":     map[string]any{"id": "turn_1", "status": "inProgress", "items": []any{}},
+			})
+			<-steered // hold the turn open
+			srv.notify(protocol.NotifyTurnCompleted, map[string]any{
+				"threadId": "thr_1",
+				"turn":     map[string]any{"id": "turn_1", "status": "completed", "items": []any{}},
+			})
+		}()
+		return map[string]any{
+			"turn": map[string]any{"id": "turn_1", "status": "inProgress", "items": []any{}},
+		}, nil
+	})
+	srv.handle("turn/steer", func(json.RawMessage, json.RawMessage) (any, map[string]any) {
+		close(steered)
+		return map[string]any{"turnId": "turn_1"}, nil
+	})
+
+	session, err := codex.Open(context.Background(), codex.WithTransport(srv))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+
+	steerErr := make(chan error, 1)
+	go func() {
+		// Wait for the turn to actually be in flight; steering before that fails
+		// because the server matches against the active turn id.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if session.CurrentTurnID() != "" {
+				break
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		if session.CurrentTurnID() != "turn_1" {
+			steerErr <- errors.New("CurrentTurnID never reported the in-flight turn")
+			return
+		}
+		_, err := session.SteerText(context.Background(), "also check the tests")
+		steerErr <- err
+	}()
+
+	result, err := session.RunText(context.Background(), "do a long multi-step task")
+	if err != nil {
+		t.Fatalf("RunText: %v", err)
+	}
+	if err := <-steerErr; err != nil {
+		t.Fatalf("steer: %v", err)
+	}
+	if result.Status() != protocol.TurnStatusCompleted {
+		t.Errorf("status = %q, want completed", result.Status())
+	}
+
+	// The steer must name the turn it expects, so the server can reject a steer
+	// aimed at a turn that already ended.
+	var sent map[string]any
+	if err := json.Unmarshal(srv.paramsFor("turn/steer"), &sent); err != nil {
+		t.Fatalf("decoding turn/steer params: %v", err)
+	}
+	if sent["expectedTurnId"] != "turn_1" {
+		t.Errorf("expectedTurnId = %v, want turn_1", sent["expectedTurnId"])
+	}
+	if sent["threadId"] != "thr_1" {
+		t.Errorf("threadId = %v, want thr_1", sent["threadId"])
+	}
+
+	// Once the turn is done there is nothing to steer, and saying so beats sending
+	// a request the server will reject.
+	if _, err := session.SteerText(context.Background(), "too late"); err == nil {
+		t.Error("steering after the turn ended succeeded, want an error")
+	}
 }
