@@ -324,6 +324,8 @@ type options struct {
 	handler *Handler
 	logger  *slog.Logger
 
+	workdirWatch bool
+
 	notificationBuffer int
 	handshakeTimeout   time.Duration
 	shutdownGrace      time.Duration
@@ -347,8 +349,9 @@ func defaultOptions() options {
 		clientTitle:   "Codex Go SDK",
 		clientVersion: "0.1.0",
 
-		handler: &Handler{},
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		handler:      &Handler{},
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		workdirWatch: true,
 
 		notificationBuffer: 1024,
 		handshakeTimeout:   30 * time.Second,

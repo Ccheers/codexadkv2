@@ -252,6 +252,7 @@ for thread, err := range client.ListThreads(ctx, protocol.ThreadListParams{}) {
 | `WithExperimentalAPI` | off |
 | `WithOptOutNotifications` | none |
 | `WithHandler` | no callbacks |
+| `WithWorkdirWatchDisabled` | auto-watch thread cwd |
 | `WithLogger` | discards |
 | `WithNotificationBuffer` | 256 per thread |
 | `WithHandshakeTimeout` | 30s |

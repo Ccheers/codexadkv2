@@ -74,9 +74,9 @@ func (c *Client) StartThread(ctx context.Context, params protocol.ThreadStartPar
 // agent's working directory without the caller explicitly calling FSWatch. It is
 // best-effort: an error (for example the server rejecting the watch) is logged and
 // does not fail thread creation. The watchId is retained so Client.Close can
-// unwatch it.
+// unwatch it. WithWorkdirWatchDisabled skips the subscription entirely.
 func (c *Client) subscribeWorkdir(ctx context.Context, cwd protocol.AbsolutePathBuf, threadID string) {
-	if cwd == "" || threadID == "" {
+	if !c.opts.workdirWatch || cwd == "" || threadID == "" {
 		return
 	}
 

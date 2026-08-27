@@ -165,6 +165,31 @@ func TestNotificationsReachTypedCallbacks(t *testing.T) {
 	}
 }
 
+func TestTurnDiffReachesTypedCallback(t *testing.T) {
+	srv := newFakeServer(t)
+
+	var (
+		mu   sync.Mutex
+		diff string
+	)
+	newTestClient(t, srv, codex.WithHandler(codex.Handler{
+		OnTurnDiff: func(n *protocol.TurnDiffUpdatedNotification) {
+			mu.Lock()
+			diff = n.Diff
+			mu.Unlock()
+		},
+	}))
+	srv.notify(protocol.NotifyTurnDiffUpdated, map[string]any{
+		"threadId": "thr_1", "turnId": "turn_1", "diff": "-a\n+b",
+	})
+
+	waitUntil(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return diff == "-a\n+b"
+	}, "OnTurnDiff did not receive the notification")
+}
+
 // TestStartThreadAutoWatchesWorkdir checks that starting a thread auto-subscribes
 // fs/watch on the thread's resolved cwd, and that a subsequent fs/changed reaches
 // OnFsChanged.
@@ -230,6 +255,32 @@ func TestStartThreadAutoWatchesWorkdir(t *testing.T) {
 	}
 	if len(changed[0].ChangedPaths) != 1 || changed[0].ChangedPaths[0] != "/repo/a.txt" {
 		t.Errorf("onFsChanged changedPaths = %v, want [ /repo/a.txt ]", changed[0].ChangedPaths)
+	}
+}
+
+// TestStartThreadWorkdirWatchDisabled checks that WithWorkdirWatchDisabled
+// suppresses the automatic fs/watch for the thread's cwd.
+func TestStartThreadWorkdirWatchDisabled(t *testing.T) {
+	srv := newFakeServer(t)
+	srv.reply("thread/start", map[string]any{
+		"thread":         map[string]any{"id": "thr_1", "sessionId": "thr_1"},
+		"model":          "gpt-5.6-terra",
+		"modelProvider":  "openai",
+		"cwd":            "/repo",
+		"approvalPolicy": "never",
+		"sandbox":        map[string]any{"type": "readOnly"},
+	})
+
+	thread, err := newTestClient(t, srv, codex.WithWorkdirWatchDisabled()).StartThread(
+		context.Background(), protocol.ThreadStartParams{})
+	if err != nil {
+		t.Fatalf("StartThread: %v", err)
+	}
+	if thread.ID() != "thr_1" {
+		t.Fatalf("thread id = %q, want thr_1", thread.ID())
+	}
+	if got := srv.paramsFor("fs/watch"); got != nil {
+		t.Errorf("fs/watch was called despite WithWorkdirWatchDisabled: %s", got)
 	}
 }
 

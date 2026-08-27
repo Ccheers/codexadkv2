@@ -115,6 +115,13 @@ func WithHandler(h Handler) Option {
 	}
 }
 
+// WithWorkdirWatchDisabled stops Client from auto-subscribing an fs/watch on the
+// thread's resolved cwd. OnFsChanged will not fire for the workdir; callers can
+// still register their own watch with FSWatch.
+func WithWorkdirWatchDisabled() Option {
+	return func(o *options) { o.workdirWatch = false }
+}
+
 // WithLogger sets the logger used for conditions the SDK must report but cannot
 // return as an error: an auto-declined approval, a dropped notification, a
 // malformed frame. Defaults to a logger that discards everything.
