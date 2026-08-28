@@ -221,12 +221,12 @@ func Open(ctx context.Context, opts ...SessionOption) (*Session, error) {
 	}
 
 	threadOpts := cfg.threadOpts
-	if hasTools {
-		threadOpts = append(threadOpts, protocol.WithThreadStartParamsDynamicTools(client.dispatch.tools.specs))
-	}
 	params := protocol.NewThreadStartParams(threadOpts...)
 	if cfg.params != nil {
 		params = *cfg.params
+	}
+	if hasTools {
+		params.DynamicTools = client.dispatch.tools.specs
 	}
 	if instr := deferLoadingInstructions(cfg.toolGroups); instr != "" {
 		// Defer-loaded groups' tool schemas are withheld from thread/start, so the
