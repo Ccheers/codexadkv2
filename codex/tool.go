@@ -62,6 +62,9 @@ type ToolGroup struct {
 	// not the individual tools.
 	Description string
 
+	// ToolDeferLoading mark the tool use deferLoading
+	ToolDeferLoading bool
+
 	// Tools are the functions nested under this group.
 	Tools []DynamicTool
 }
@@ -251,9 +254,10 @@ func buildToolRegistry(singles []DynamicTool, groups []ToolGroup) (*toolRegistry
 			}
 			fn := protocol.NewDynamicToolNamespaceToolFunction(
 				protocol.DynamicToolNamespaceToolFunctionPayload{
-					Name:        tool.Name(),
-					Description: tool.Description(),
-					InputSchema: schema,
+					Name:         tool.Name(),
+					Description:  tool.Description(),
+					InputSchema:  schema,
+					DeferLoading: &group.ToolDeferLoading,
 				})
 			nested = append(nested, &fn)
 		}

@@ -151,7 +151,8 @@ func run(prompt string, timeout time.Duration) error {
 			// alone whether to look at the tools inside.
 			Description: "Read and update the warehouse inventory held by this program. " +
 				"Use it for any question about stock levels; the data exists nowhere else.",
-			Tools: []codex.DynamicTool{stock, restock},
+			Tools:            []codex.DynamicTool{stock, restock},
+			ToolDeferLoading: true,
 		}),
 		codex.WithThreadOptions(
 			protocol.WithThreadStartParamsCwd(cwd),
