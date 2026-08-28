@@ -426,6 +426,157 @@ func TestToolRegistrationValidation(t *testing.T) {
 	}
 }
 
+// TestDeferLoadingInstructions pins the developer-instructions prompt for
+// defer-loaded groups: 只有 ToolDeferLoading 为 true 的组才进提示词，普通组不进，
+// 格式为 Name/Description 加 Name__tool 列表，且与调用方自带提示词叠加而非覆盖。
+func TestDeferLoadingInstructions(t *testing.T) {
+	deferred := codex.ToolGroup{
+		Name:        "db",
+		Description: "Inspect the application database",
+		Tools: []codex.DynamicTool{
+			codex.NewTool[struct{}]("query", "Run a query", func(context.Context, string, struct{}) (string, error) { return "", nil }),
+			codex.NewTool[struct{}]("migrate", "Run a migration", func(context.Context, string, struct{}) (string, error) { return "", nil }),
+		},
+		ToolDeferLoading: true,
+	}
+	eager := codex.ToolGroup{
+		Name:        "fs",
+		Description: "Read and write files",
+		Tools: []codex.DynamicTool{
+			codex.NewTool[struct{}]("read", "Read a file", func(context.Context, string, struct{}) (string, error) { return "", nil }),
+		},
+	}
+
+	t.Run("injects and skips eager groups", func(t *testing.T) {
+		srv := newFakeServer(t)
+		srv.reply("thread/start", threadResponse("thr_1"))
+
+		session, err := codex.Open(context.Background(),
+			codex.WithTransport(srv),
+			codex.WithToolGroups(deferred, eager),
+		)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+
+		var started struct {
+			DeveloperInstructions string `json:"developerInstructions"`
+		}
+		if err := json.Unmarshal(srv.paramsFor("thread/start"), &started); err != nil {
+			t.Fatalf("decoding thread/start params: %v", err)
+		}
+
+		want := "## ToolGroups:\n" +
+			"### db\nInspect the application database\n" +
+			"- db__query\n" +
+			"- db__migrate\n"
+		if started.DeveloperInstructions != want {
+			t.Errorf("developerInstructions =\n%q\nwant\n%q", started.DeveloperInstructions, want)
+		}
+	})
+
+	t.Run("appends to caller-provided prompt", func(t *testing.T) {
+		srv := newFakeServer(t)
+		srv.reply("thread/start", threadResponse("thr_1"))
+
+		session, err := codex.Open(context.Background(),
+			codex.WithTransport(srv),
+			codex.WithToolGroups(deferred),
+			codex.WithThreadOptions(protocol.WithThreadStartParamsDeveloperInstructions("caller system prompt")),
+		)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+
+		var started struct {
+			DeveloperInstructions string `json:"developerInstructions"`
+		}
+		if err := json.Unmarshal(srv.paramsFor("thread/start"), &started); err != nil {
+			t.Fatalf("decoding thread/start params: %v", err)
+		}
+
+		want := "caller system prompt\n\n" +
+			"## ToolGroups:\n### db\nInspect the application database\n- db__query\n- db__migrate\n"
+		if started.DeveloperInstructions != want {
+			t.Errorf("developerInstructions =\n%q\nwant caller prompt with defer map appended:\n%q",
+				started.DeveloperInstructions, want)
+		}
+	})
+}
+
+// TestResumeInjectsDeferLoadingInstructions pins Resume 同样注入 defer 提示词：
+// 提示词不在 rollout 里，续接线程时须随 thread/resume 重新下发；调用方已通过
+// WithResumeThreadParams 自带 developerInstructions 时以调用方为准。
+func TestResumeInjectsDeferLoadingInstructions(t *testing.T) {
+	group := codex.ToolGroup{
+		Name:        "db",
+		Description: "Inspect the application database",
+		Tools: []codex.DynamicTool{
+			codex.NewTool[struct{}]("query", "Run a query", func(context.Context, string, struct{}) (string, error) { return "", nil }),
+		},
+		ToolDeferLoading: true,
+	}
+
+	t.Run("injects when absent", func(t *testing.T) {
+		srv := newFakeServer(t)
+		srv.reply("thread/resume", threadResponse("thr_existing"))
+
+		sess, err := codex.Resume(context.Background(),
+			codex.WithTransport(srv),
+			codex.WithResumeThreadID("thr_existing"),
+			codex.WithToolGroups(group),
+		)
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		t.Cleanup(func() { _ = sess.Close() })
+
+		var resumed struct {
+			DeveloperInstructions string `json:"developerInstructions"`
+		}
+		if err := json.Unmarshal(srv.paramsFor("thread/resume"), &resumed); err != nil {
+			t.Fatalf("decoding thread/resume params: %v", err)
+		}
+		want := "## ToolGroups:\n### db\nInspect the application database\n- db__query\n"
+		if resumed.DeveloperInstructions != want {
+			t.Errorf("developerInstructions =\n%q\nwant\n%q", resumed.DeveloperInstructions, want)
+		}
+	})
+
+	t.Run("appends to caller-provided prompt", func(t *testing.T) {
+		srv := newFakeServer(t)
+		srv.reply("thread/resume", threadResponse("thr_existing"))
+
+		sess, err := codex.Resume(context.Background(),
+			codex.WithTransport(srv),
+			codex.WithResumeThreadID("thr_existing"),
+			codex.WithToolGroups(group),
+			codex.WithResumeThreadParams(protocol.ThreadResumeParams{
+				DeveloperInstructions: protocol.Ptr("caller system prompt"),
+			}),
+		)
+		if err != nil {
+			t.Fatalf("Resume: %v", err)
+		}
+		t.Cleanup(func() { _ = sess.Close() })
+
+		var resumed struct {
+			DeveloperInstructions string `json:"developerInstructions"`
+		}
+		if err := json.Unmarshal(srv.paramsFor("thread/resume"), &resumed); err != nil {
+			t.Fatalf("decoding thread/resume params: %v", err)
+		}
+		want := "caller system prompt\n\n" +
+			"## ToolGroups:\n### db\nInspect the application database\n- db__query\n"
+		if resumed.DeveloperInstructions != want {
+			t.Errorf("developerInstructions =\n%q\nwant caller prompt with defer map appended:\n%q",
+				resumed.DeveloperInstructions, want)
+		}
+	})
+}
+
 // TestSameToolInDifferentGroups: a tool carries no namespace of its own, so the
 // same instance can be assembled into different groups.
 func TestSameToolInDifferentGroups(t *testing.T) {

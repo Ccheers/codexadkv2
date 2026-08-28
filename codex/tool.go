@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/invopop/jsonschema"
 
@@ -163,6 +164,39 @@ func reflectToolSchema[Args any]() map[string]any {
 	}
 	delete(schema, "$schema")
 	return schema
+}
+
+// deferLoadingInstructions renders the developer-instructions block for groups
+// whose tools are defer-loaded. A defer-loaded group's schemas are withheld
+// from thread/start, so this prompt is the model's only upfront map of what
+// those tools are and how to address them.
+func deferLoadingInstructions(groups []ToolGroup) string {
+	var b strings.Builder
+	for _, group := range groups {
+		if !group.ToolDeferLoading {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("### %s\n%s\n", group.Name, group.Description))
+		for _, tool := range group.Tools {
+			b.WriteString(fmt.Sprintf("- %s__%s\n", group.Name, tool.Name()))
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return "## ToolGroups:\n" + b.String()
+}
+
+// appendDeveloperInstructions appends a block to existing developer
+// instructions. The field is a single string on the wire, so "two sources set
+// it" resolves by concatenation rather than last-write-wins: the caller's
+// prompt and the SDK's defer-loading map are complements, not alternatives.
+func appendDeveloperInstructions(existing *string, block string) *string {
+	if existing == nil || *existing == "" {
+		return &block
+	}
+	joined := *existing + "\n\n" + block
+	return &joined
 }
 
 // toolKey identifies a tool for dispatch. A tool inside a group is addressed by

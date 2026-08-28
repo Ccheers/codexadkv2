@@ -220,12 +220,19 @@ func Open(ctx context.Context, opts ...SessionOption) (*Session, error) {
 		return nil, err
 	}
 
-	params := protocol.NewThreadStartParams(cfg.threadOpts...)
+	threadOpts := cfg.threadOpts
+	if hasTools {
+		threadOpts = append(threadOpts, protocol.WithThreadStartParamsDynamicTools(client.dispatch.tools.specs))
+	}
+	params := protocol.NewThreadStartParams(threadOpts...)
 	if cfg.params != nil {
 		params = *cfg.params
 	}
-	if hasTools {
-		params.DynamicTools = client.dispatch.tools.specs
+	if instr := deferLoadingInstructions(cfg.toolGroups); instr != "" {
+		// Defer-loaded groups' tool schemas are withheld from thread/start, so the
+		// developer instructions must carry the map of what exists and how to
+		// address it. 追加到调用方已有的提示词之后，而不是覆盖。
+		params.DeveloperInstructions = appendDeveloperInstructions(params.DeveloperInstructions, instr)
 	}
 
 	thread, err := client.StartThread(ctx, params)
@@ -278,6 +285,11 @@ func Resume(ctx context.Context, opts ...SessionOption) (*Session, error) {
 	if cfg.resumeParams != nil {
 		params = *cfg.resumeParams
 		params.ThreadID = cfg.resumeThreadID // 以 option 为准，拼进来的 params 不许覆盖 id
+	}
+	if instr := deferLoadingInstructions(cfg.toolGroups); instr != "" {
+		// Defer 提示词不在 rollout 里，恢复线程时需要随 resume 重新下发；追加到调用方
+		// 已有的提示词之后，而不是覆盖。
+		params.DeveloperInstructions = appendDeveloperInstructions(params.DeveloperInstructions, instr)
 	}
 
 	thread, err := client.ResumeThread(ctx, params)
