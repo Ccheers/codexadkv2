@@ -201,6 +201,8 @@ The input schema is reflected from the `Args` type. **A field is required unless
 
 **Return an error, not an error string.** A non-nil error becomes a failed tool call with your message as the reason, and the model can act on it. Observed live: an agent called `check("sprockets")`, got back `no such item "sprockets"; known items are widget, gizmo, sprocket`, and retried with the singular form.
 
+**Results are bounded before they reach the model.** A handler's return value is the one part of a turn whose size this SDK does not control, so dispatch caps it (see `ToolResultGuard`): above 20 KiB the model gets the first and last 20 lines, each cut at 500 runes, followed by the path of a file holding the whole result. Return the full output anyway — pre-truncating in the handler hides text the model could still read from that file. The file goes to a subdirectory of the temp dir unless `WithToolResultSpillDir` points it somewhere the agent can actually open, which for a sandboxed model means under the thread's working directory.
+
 Dynamic tools are experimental, so `Open` enables the capability automatically when any tool is registered — the server rejects `dynamicTools` without it. Registration mistakes (duplicate names, a group with no description) fail at `Open` before a server is spawned, rather than mid-turn.
 
 Run `go run ./examples/tools` to see it work.

@@ -44,6 +44,12 @@ type DynamicTool interface {
 	// The context is the one the session was opened with, so a cancelled session
 	// cancels in-flight tool calls. Calls run on their own goroutine and may block
 	// as long as the work genuinely takes; the turn is waiting on the answer.
+	//
+	// The result does not reach the model verbatim: dispatch bounds it with a
+	// ToolResultGuard, so an oversized result is spilled to a file and answered
+	// with its head and tail plus that path. Return the whole thing anyway — the
+	// guard preserves it, and pre-truncating in the handler would hide output the
+	// model may still want to read from the file.
 	Call(ctx context.Context, callID string, args json.RawMessage) (string, error)
 }
 
@@ -213,6 +219,11 @@ func toolKey(namespace, name string) string {
 type toolRegistry struct {
 	tools map[string]DynamicTool
 	specs []*protocol.DynamicToolSpec
+	// guard bounds every result this registry answers with. It lives here rather
+	// than on the tools because dispatch is the one place all tool calls pass
+	// through: a DynamicTool is built by its own constructor, long before any
+	// session config exists, so it has nowhere to be told the spill directory.
+	guard ToolResultGuard
 }
 
 // buildToolRegistry validates the tools and renders the protocol spec.
@@ -220,8 +231,8 @@ type toolRegistry struct {
 // Validation happens here rather than at call time because a duplicate or unnamed
 // tool is a programming error the caller should hear about when opening the
 // session, not when the model happens to invoke it mid-turn.
-func buildToolRegistry(singles []DynamicTool, groups []ToolGroup) (*toolRegistry, error) {
-	reg := &toolRegistry{tools: make(map[string]DynamicTool)}
+func buildToolRegistry(singles []DynamicTool, groups []ToolGroup, guard ToolResultGuard) (*toolRegistry, error) {
+	reg := &toolRegistry{tools: make(map[string]DynamicTool), guard: guard}
 
 	add := func(namespace string, tool DynamicTool) error {
 		if tool == nil {
@@ -337,17 +348,21 @@ func (r *toolRegistry) dispatchToolCall(
 	}
 
 	tool := r.lookup(namespace, p.Tool)
+	name := qualifiedToolName(namespace, p.Tool)
 	if tool == nil {
 		// Answer rather than error out: the turn is blocked on a reply, and telling
 		// the model the tool does not exist lets it recover.
-		return failedToolCall(fmt.Sprintf("unknown tool %q", qualifiedToolName(namespace, p.Tool)))
+		return failedToolCall(fmt.Sprintf("unknown tool %q", name))
 	}
 
+	// Both outcomes go through the guard: a failure reason is handler-written text
+	// like any other result, and an error that quotes a huge body would otherwise
+	// do the same damage from the other branch.
 	content, err := tool.Call(ctx, p.CallID, p.Arguments)
 	if err != nil {
-		return failedToolCall(err.Error())
+		return failedToolCall(r.guard.Apply(name, err.Error()))
 	}
-	return successfulToolCall(content)
+	return successfulToolCall(r.guard.Apply(name, content))
 }
 
 func qualifiedToolName(namespace, name string) string {

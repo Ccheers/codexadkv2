@@ -73,6 +73,10 @@ type sessionConfig struct {
 
 	tools      []DynamicTool
 	toolGroups []ToolGroup
+
+	// toolResultSpillDir 交给 toolRegistry 的 ToolResultGuard：超长工具结果全量落盘的
+	// 目录。空 = guard 回落到 os.TempDir() 下的子目录。
+	toolResultSpillDir string
 }
 
 // WithResumeThreadID 让 Session 按已存的 thread id 恢复线程，而不是新建。
@@ -159,6 +163,18 @@ func WithToolGroups(groups ...ToolGroup) SessionOption {
 	})
 }
 
+// WithToolResultSpillDir sets the directory an oversized tool result is written to
+// before it is truncated for the model (see ToolResultGuard). Defaults to a
+// "codex-tool-results" subdirectory of os.TempDir().
+//
+// Set this to somewhere the agent can read. The truncated result tells the model
+// where the full output went and expects it to be able to open that path, so a
+// directory outside the sandbox the model runs in turns the note into a dead end.
+// Under the thread's working directory is usually right.
+func WithToolResultSpillDir(dir string) SessionOption {
+	return sessionOptionFunc(func(c *sessionConfig) { c.toolResultSpillDir = dir })
+}
+
 // newClient 建 codex client 并装配动态工具。Open 与 Resume 共用这一步骤：两者都要
 // spawn 子进程 + 握手 + 注册 handler 的 dispatch（tool call 由 SDK 内部派发），区别只在
 // 最后一步是 StartThread 还是 ResumeThread。
@@ -168,7 +184,8 @@ func newClient(ctx context.Context, cfg *sessionConfig) (*Client, bool, error) {
 	// Validate the tools before spawning anything: a duplicate or undescribed tool
 	// is a programming error, and reporting it without having started a server
 	// first keeps the failure cheap and the message clear.
-	registry, err := buildToolRegistry(cfg.tools, cfg.toolGroups)
+	registry, err := buildToolRegistry(cfg.tools, cfg.toolGroups,
+		ToolResultGuard{SpillDir: cfg.toolResultSpillDir})
 	if err != nil {
 		return nil, false, err
 	}
